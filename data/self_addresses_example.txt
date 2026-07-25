@@ -1,0 +1,9 @@
+# Your own email addresses, one per line -- these get excluded from
+# contact_emails_in_body since they're not attacker IOCs (they show up in
+# salutations, "Dear you@example.com...", etc.). Lines starting with # are
+# ignored.
+#
+# Copy this file to self_addresses.txt (gitignored) and fill in your own
+# addresses -- ioc_lib.py reads that file, not this one.
+you@example.com
+you@your-other-provider.example

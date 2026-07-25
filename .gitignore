@@ -1,0 +1,20 @@
+# Personal data -- your inbox contents, extracted IOCs, generated reports
+data/*
+output/
+
+# ...except manual WHOIS/registrar research -- that's about the scam
+# infrastructure, not your email content, so it's fine (and useful) to
+# keep in git history.
+!data/domain_enrichment_example.csv
+
+# ...and the self-addresses format template (no real addresses in it).
+!data/self_addresses_example.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS cruft
+.DS_Store

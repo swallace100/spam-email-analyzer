@@ -1,0 +1,596 @@
+#!/usr/bin/env python3
+"""Regenerate output/master_report.xlsx from the running master CSV.
+Safe to run repeatedly -- it's a full rebuild from the CSV, not an append,
+so the CSV is always the source of truth."""
+
+import csv
+import os
+from collections import Counter, defaultdict
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+MASTER_CSV = os.path.join(BASE, "data", "master_iocs.csv")
+MASTER_URLS_CSV = os.path.join(BASE, "data", "master_urls.csv")
+ENRICHMENT_CSV = os.path.join(BASE, "data", "domain_enrichment.csv")
+OUT_XLSX = os.path.join(BASE, "output", "master_report.xlsx")
+
+
+def load_enrichment():
+    if not os.path.exists(ENRICHMENT_CSV):
+        return {}
+    with open(ENRICHMENT_CSV, encoding="utf-8") as f:
+        return {r["domain"]: r for r in csv.DictReader(f)}
+
+
+# --- Template clustering (groups messages by body similarity) ----------
+# ioc_lib stores a SimHash fingerprint of each body's template (URLs/
+# emails/phones/wallets stripped out) rather than the body itself. Two
+# fingerprints with a small Hamming distance likely came from the same
+# scam template even if sender and contact info differ. O(n^2) pairwise
+# comparison is fine at the personal-mailbox scale this tool targets
+# (thousands of rows); if that ever changes, band the fingerprints instead
+# of comparing every pair.
+TEMPLATE_HAMMING_THRESHOLD = 3
+
+
+def _hamming(a, b):
+    return bin(a ^ b).count("1")
+
+
+class _UnionFind:
+    def __init__(self, n):
+        self.parent = list(range(n))
+
+    def find(self, x):
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.parent[ra] = rb
+
+
+def cluster_by_template(rows):
+    """Return groups of 2+ rows whose body_template_fingerprint values are
+    within TEMPLATE_HAMMING_THRESHOLD bits of each other."""
+    fps = []
+    for r in rows:
+        fp_hex = r.get("body_template_fingerprint") or ""
+        fps.append(int(fp_hex, 16) if fp_hex else None)
+
+    indices = [i for i, fp in enumerate(fps) if fp]  # skip empty/all-zero bodies
+    uf = _UnionFind(len(rows))
+    for a in range(len(indices)):
+        i = indices[a]
+        for b in range(a + 1, len(indices)):
+            j = indices[b]
+            if _hamming(fps[i], fps[j]) <= TEMPLATE_HAMMING_THRESHOLD:
+                uf.union(i, j)
+
+    clusters = defaultdict(list)
+    for i in indices:
+        clusters[uf.find(i)].append(rows[i])
+    return [members for members in clusters.values() if len(members) >= 2]
+
+
+FONT = "Arial"
+HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
+HEADER_FONT = Font(name=FONT, bold=True, color="FFFFFF")
+CAT_FILLS = {
+    "likely_scam": PatternFill("solid", fgColor="F8CBAD"),
+    "review": PatternFill("solid", fgColor="FFE699"),
+    "bulk_marketing": PatternFill("solid", fgColor="E2EFDA"),
+}
+CELL_FONT = Font(name=FONT, size=10)
+WRAP = Alignment(wrap_text=True, vertical="top")
+
+
+def main():
+    if not os.path.exists(MASTER_CSV):
+        print(f"No {MASTER_CSV} yet -- nothing to build.")
+        return
+
+    with open(MASTER_CSV, encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    url_rows = []
+    if os.path.exists(MASTER_URLS_CSV):
+        with open(MASTER_URLS_CSV, encoding="utf-8") as f:
+            url_rows = list(csv.DictReader(f))
+    enrichment = load_enrichment()
+
+    wb = Workbook()
+
+    # ---- Summary ----
+    ws = wb.active
+    ws.title = "Summary"
+    ws.sheet_view.showGridLines = False
+    ws["B2"] = "Scam Email Tracker — Master Report"
+    ws["B2"].font = Font(name=FONT, bold=True, size=16)
+    ws["B3"] = f"{len(rows)} messages total"
+    ws["B3"].font = Font(name=FONT, italic=True, size=10, color="666666")
+
+    cat_counts = Counter(r["category"] for r in rows)
+    row = 5
+    ws.cell(row=row, column=2, value="Category").font = HEADER_FONT
+    ws.cell(row=row, column=2).fill = HEADER_FILL
+    ws.cell(row=row, column=3, value="Count").font = HEADER_FONT
+    ws.cell(row=row, column=3).fill = HEADER_FILL
+    for cat in ["likely_scam", "review", "bulk_marketing"]:
+        row += 1
+        ws.cell(row=row, column=2, value=cat).font = CELL_FONT
+        ws.cell(row=row, column=3, value=cat_counts.get(cat, 0)).font = CELL_FONT
+
+    row += 2
+    domain_counter = Counter(r["from_domain"] for r in rows if r["from_domain"])
+    ws.cell(row=row, column=2, value="Repeated sender domains (2+ messages)").font = Font(name=FONT, bold=True, size=11)
+    row += 1
+    ws.cell(row=row, column=2, value="Domain").font = HEADER_FONT
+    ws.cell(row=row, column=2).fill = HEADER_FILL
+    ws.cell(row=row, column=3, value="Count").font = HEADER_FONT
+    ws.cell(row=row, column=3).fill = HEADER_FILL
+    for d, c in domain_counter.most_common(20):
+        if c < 2:
+            continue
+        row += 1
+        ws.cell(row=row, column=2, value=d).font = CELL_FONT
+        ws.cell(row=row, column=3, value=c).font = CELL_FONT
+
+    ws.column_dimensions["A"].width = 3
+    ws.column_dimensions["B"].width = 50
+    ws.column_dimensions["C"].width = 14
+
+    # ---- Emails (all) ----
+    ws2 = wb.create_sheet("Emails")
+    fieldnames = list(rows[0].keys())
+    for col, name in enumerate(fieldnames, start=1):
+        c = ws2.cell(row=1, column=col, value=name.replace("_", " ").title())
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    for r_idx, r in enumerate(rows, start=2):
+        cat_fill = CAT_FILLS.get(r.get("category", ""))
+        for col, name in enumerate(fieldnames, start=1):
+            c = ws2.cell(row=r_idx, column=col, value=r[name])
+            c.font = CELL_FONT
+            c.alignment = WRAP
+            if name == "category" and cat_fill:
+                c.fill = cat_fill
+    ws2.freeze_panes = "A2"
+    ws2.auto_filter.ref = ws2.dimensions
+    widths = {"date": 20, "subject": 40, "from_name": 16, "from_addr": 28, "from_domain": 22,
+              "return_path": 28, "reply_to_addr": 24, "dkim": 8, "spf": 8, "dmarc": 8,
+              "originating_ips": 24, "url_count": 10, "url_domains": 26, "phone_numbers": 20,
+              "btc_addresses": 20, "eth_addresses": 20, "contact_emails_in_body": 30,
+              "first_url": 30, "id": 12, "source": 14, "category": 16, "list_unsubscribe": 14,
+              "impersonated_brands": 24, "body_template_fingerprint": 18}
+    for col, name in enumerate(fieldnames, start=1):
+        ws2.column_dimensions[get_column_letter(col)].width = widths.get(name, 16)
+
+    # ---- URLs ----
+    ws3 = wb.create_sheet("URLs")
+    url_fields = ["id", "url", "domain"]
+    for col, name in enumerate(url_fields, start=1):
+        c = ws3.cell(row=1, column=col, value=name.title())
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    for r_idx, r in enumerate(url_rows, start=2):
+        for col, name in enumerate(url_fields, start=1):
+            ws3.cell(row=r_idx, column=col, value=r[name]).font = CELL_FONT
+    ws3.freeze_panes = "A2"
+    if url_rows:
+        ws3.auto_filter.ref = ws3.dimensions
+    ws3.column_dimensions["A"].width = 12
+    ws3.column_dimensions["B"].width = 70
+    ws3.column_dimensions["C"].width = 30
+
+    # ---- Domain Clusters ----
+    ws4 = wb.create_sheet("Domain Clusters")
+    cluster_map = defaultdict(list)
+    for r in rows:
+        if r["from_domain"]:
+            cluster_map[r["from_domain"]].append(r)
+    headers4 = ["Sender Domain", "Message Count", "Categories Seen", "Registered", "Registrar",
+                "Sample Subjects", "Sample Message IDs"]
+    for col, name in enumerate(headers4, start=1):
+        c = ws4.cell(row=1, column=col, value=name)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    r_idx = 2
+    ENRICHED_FILL = PatternFill("solid", fgColor="D9E1F2")
+    for d, items in sorted(cluster_map.items(), key=lambda x: -len(x[1])):
+        if len(items) < 2:
+            continue
+        cats = ", ".join(sorted(set(it["category"] for it in items)))
+        subs = " | ".join(it["subject"][:60] for it in items[:4])
+        ids = ", ".join(it["id"] for it in items[:6])
+        enr = enrichment.get(d)
+        registered = enr["registered_date"] if enr else ""
+        registrar = enr["registrar"] if enr else ""
+        ws4.cell(row=r_idx, column=1, value=d).font = CELL_FONT
+        ws4.cell(row=r_idx, column=2, value=len(items)).font = CELL_FONT
+        ws4.cell(row=r_idx, column=3, value=cats).font = CELL_FONT
+        c_reg = ws4.cell(row=r_idx, column=4, value=registered)
+        c_reg.font = CELL_FONT
+        c_regr = ws4.cell(row=r_idx, column=5, value=registrar)
+        c_regr.font = CELL_FONT
+        if enr:
+            c_reg.fill = ENRICHED_FILL
+            c_regr.fill = ENRICHED_FILL
+        ws4.cell(row=r_idx, column=6, value=subs).font = CELL_FONT
+        ws4.cell(row=r_idx, column=6).alignment = WRAP
+        ws4.cell(row=r_idx, column=7, value=ids).font = CELL_FONT
+        r_idx += 1
+    ws4.freeze_panes = "A2"
+    if r_idx > 2:
+        ws4.auto_filter.ref = f"A1:G{r_idx-1}"
+    ws4.column_dimensions["A"].width = 28
+    ws4.column_dimensions["B"].width = 14
+    ws4.column_dimensions["C"].width = 24
+    ws4.column_dimensions["D"].width = 14
+    ws4.column_dimensions["E"].width = 20
+    ws4.column_dimensions["F"].width = 60
+    ws4.column_dimensions["G"].width = 40
+
+    # ---- Domain Enrichment (WHOIS notes) ----
+    ws5 = wb.create_sheet("Domain Enrichment")
+    headers5 = ["Domain", "Registered", "Registrar", "Notes"]
+    for col, name in enumerate(headers5, start=1):
+        c = ws5.cell(row=1, column=col, value=name)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    r_idx = 2
+    for d, enr in enrichment.items():
+        ws5.cell(row=r_idx, column=1, value=d).font = CELL_FONT
+        ws5.cell(row=r_idx, column=2, value=enr["registered_date"]).font = CELL_FONT
+        ws5.cell(row=r_idx, column=3, value=enr["registrar"]).font = CELL_FONT
+        c_notes = ws5.cell(row=r_idx, column=4, value=enr["notes"])
+        c_notes.font = CELL_FONT
+        c_notes.alignment = WRAP
+        r_idx += 1
+    ws5.freeze_panes = "A2"
+    if r_idx > 2:
+        ws5.auto_filter.ref = f"A1:D{r_idx-1}"
+    ws5.column_dimensions["A"].width = 26
+    ws5.column_dimensions["B"].width = 14
+    ws5.column_dimensions["C"].width = 20
+    ws5.column_dimensions["D"].width = 90
+
+    # ---- Template Clusters (messages sharing a body template) ----
+    # Groups messages whose bodies are near-duplicates once the parts that
+    # vary per-blast (URLs, emails, phones, wallets) are stripped out -- this
+    # catches the same scam template being reused across different
+    # senders/domains even when there's no exact repeated contact string.
+    ws_templates = wb.create_sheet("Template Clusters")
+    headers_t = ["Cluster", "Message Count", "Distinct Sender Domains", "Categories Seen",
+                 "Contacts Seen In Cluster", "Sample Subjects", "Sample Message IDs"]
+    for col, name in enumerate(headers_t, start=1):
+        c = ws_templates.cell(row=1, column=col, value=name)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    template_clusters = sorted(cluster_by_template(rows), key=lambda members: -len(members))
+    r_idx = 2
+    for cluster_num, members in enumerate(template_clusters, start=1):
+        doms = sorted(set(m["from_domain"] for m in members if m["from_domain"]))
+        cats = ", ".join(sorted(set(m["category"] for m in members)))
+        contacts = set()
+        for m in members:
+            contacts.update(x.strip() for x in (m.get("contacts_functional") or "").split(";") if x.strip())
+            contacts.update(x.strip() for x in (m.get("phones_functional") or "").split(";") if x.strip())
+        subs = " | ".join(m["subject"][:60] for m in members[:4])
+        ids = ", ".join(m["id"] for m in members[:6])
+        ws_templates.cell(row=r_idx, column=1, value=cluster_num).font = CELL_FONT
+        ws_templates.cell(row=r_idx, column=2, value=len(members)).font = CELL_FONT
+        ws_templates.cell(row=r_idx, column=3, value=len(doms)).font = CELL_FONT
+        ws_templates.cell(row=r_idx, column=4, value=cats).font = CELL_FONT
+        c_contacts = ws_templates.cell(row=r_idx, column=5, value="; ".join(sorted(contacts)))
+        c_contacts.font = CELL_FONT
+        c_contacts.alignment = WRAP
+        c_subs = ws_templates.cell(row=r_idx, column=6, value=subs)
+        c_subs.font = CELL_FONT
+        c_subs.alignment = WRAP
+        ws_templates.cell(row=r_idx, column=7, value=ids).font = CELL_FONT
+        r_idx += 1
+    ws_templates.freeze_panes = "A2"
+    if r_idx > 2:
+        ws_templates.auto_filter.ref = f"A1:G{r_idx-1}"
+    ws_templates.column_dimensions["A"].width = 10
+    ws_templates.column_dimensions["B"].width = 14
+    ws_templates.column_dimensions["C"].width = 20
+    ws_templates.column_dimensions["D"].width = 24
+    ws_templates.column_dimensions["E"].width = 40
+    ws_templates.column_dimensions["F"].width = 60
+    ws_templates.column_dimensions["G"].width = 40
+
+    # ---- Impersonated Brands (subcategory on top of triage) ----
+    ws_brands = wb.create_sheet("Brands")
+    brand_map = defaultdict(list)
+    for r in rows:
+        for b in (r.get("impersonated_brands") or "").split(";"):
+            b = b.strip()
+            if b:
+                brand_map[b].append(r)
+    headers_b = ["Brand", "Message Count", "Categories Seen", "Distinct Sender Domains",
+                 "Sample Subjects", "Sample Message IDs"]
+    for col, name in enumerate(headers_b, start=1):
+        c = ws_brands.cell(row=1, column=col, value=name)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    r_idx = 2
+    for b, items in sorted(brand_map.items(), key=lambda x: -len(x[1])):
+        doms = sorted(set(it["from_domain"] for it in items if it["from_domain"]))
+        cats = ", ".join(sorted(set(it["category"] for it in items)))
+        subs = " | ".join(it["subject"][:60] for it in items[:4])
+        ids = ", ".join(it["id"] for it in items[:6])
+        ws_brands.cell(row=r_idx, column=1, value=b).font = CELL_FONT
+        ws_brands.cell(row=r_idx, column=2, value=len(items)).font = CELL_FONT
+        ws_brands.cell(row=r_idx, column=3, value=cats).font = CELL_FONT
+        ws_brands.cell(row=r_idx, column=4, value=len(doms)).font = CELL_FONT
+        c_subs = ws_brands.cell(row=r_idx, column=5, value=subs)
+        c_subs.font = CELL_FONT
+        c_subs.alignment = WRAP
+        ws_brands.cell(row=r_idx, column=6, value=ids).font = CELL_FONT
+        r_idx += 1
+    ws_brands.freeze_panes = "A2"
+    if r_idx > 2:
+        ws_brands.auto_filter.ref = f"A1:F{r_idx-1}"
+    ws_brands.column_dimensions["A"].width = 26
+    ws_brands.column_dimensions["B"].width = 14
+    ws_brands.column_dimensions["C"].width = 24
+    ws_brands.column_dimensions["D"].width = 20
+    ws_brands.column_dimensions["E"].width = 60
+    ws_brands.column_dimensions["F"].width = 40
+
+    # ---- Phone Numbers ----
+    # Confidence: "functional" = keyword-confirmed (near "call"/"phone"/etc.)
+    # AND not sitting in a dense cluster of other PII -- these are worth
+    # acting on. "filler" = matched by formatting alone or found inside a
+    # stuffed word-salad block -- probably spam-filter evasion noise, not a
+    # real contact point. See ioc_lib.classify_phones.
+    FUNCTIONAL_FILL = PatternFill("solid", fgColor="C6EFCE")
+    FILLER_FILL = PatternFill("solid", fgColor="F2F2F2")
+    FUNCTIONAL_FONT = Font(name=FONT, size=10, bold=True, color="006100")
+    FILLER_FONT = Font(name=FONT, size=10, italic=True, color="808080")
+
+    ws7 = wb.create_sheet("Phone Numbers")
+    phone_map = defaultdict(list)
+    for r in rows:
+        for p in (r.get("phone_numbers") or "").split(";"):
+            p = p.strip()
+            if p:
+                functional_set = {x.strip() for x in (r.get("phones_functional") or "").split(";") if x.strip()}
+                phone_map[p].append((r, p in functional_set))
+    headers7 = ["Phone Number", "Confidence", "Times Seen", "Distinct Sender Domains",
+                "Sample Subjects", "Sample Message IDs"]
+    for col, name in enumerate(headers7, start=1):
+        c = ws7.cell(row=1, column=col, value=name)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    r_idx = 2
+    # sort: functional first, then by frequency
+    def phone_sort_key(item):
+        p, entries = item
+        is_func = any(f for _, f in entries)
+        return (0 if is_func else 1, -len(entries))
+    for p, entries in sorted(phone_map.items(), key=phone_sort_key):
+        items = [r for r, f in entries]
+        is_functional = any(f for _, f in entries)
+        doms = sorted(set(it["from_domain"] for it in items if it["from_domain"]))
+        subs = " | ".join(it["subject"][:60] for it in items[:4])
+        ids = ", ".join(it["id"] for it in items[:6])
+        conf_label = "functional" if is_functional else "filler"
+        conf_fill = FUNCTIONAL_FILL if is_functional else FILLER_FILL
+        conf_font = FUNCTIONAL_FONT if is_functional else FILLER_FONT
+        ws7.cell(row=r_idx, column=1, value=p).font = CELL_FONT
+        c_conf = ws7.cell(row=r_idx, column=2, value=conf_label)
+        c_conf.font = conf_font
+        c_conf.fill = conf_fill
+        ws7.cell(row=r_idx, column=3, value=len(items)).font = CELL_FONT
+        ws7.cell(row=r_idx, column=4, value=len(doms)).font = CELL_FONT
+        ws7.cell(row=r_idx, column=5, value=subs).font = CELL_FONT
+        ws7.cell(row=r_idx, column=5).alignment = WRAP
+        ws7.cell(row=r_idx, column=6, value=ids).font = CELL_FONT
+        r_idx += 1
+    ws7.freeze_panes = "A2"
+    if r_idx > 2:
+        ws7.auto_filter.ref = f"A1:F{r_idx-1}"
+    ws7.column_dimensions["A"].width = 20
+    ws7.column_dimensions["B"].width = 12
+    ws7.column_dimensions["C"].width = 12
+    ws7.column_dimensions["D"].width = 20
+    ws7.column_dimensions["E"].width = 60
+    ws7.column_dimensions["F"].width = 40
+
+    # ---- Email Addresses (all contact emails found in body text) ----
+    # Every email address extracted from message bodies, regardless of how
+    # many different sender domains it showed up in (Cross-Domain Contacts
+    # below only lists ones seen across 2+ domains -- this tab is the full
+    # list, single-occurrence addresses included, mirroring Phone Numbers.
+    ws8 = wb.create_sheet("Email Addresses")
+    email_map = defaultdict(list)
+    for r in rows:
+        functional_set = {x.strip().lower() for x in (r.get("contacts_functional") or "").split(";") if x.strip()}
+        for e in (r.get("contact_emails_in_body") or "").split(";"):
+            e = e.strip()
+            if e:
+                email_map[e].append((r, e.lower() in functional_set))
+    headers8 = ["Email Address", "Confidence", "Times Seen", "Distinct Sender Domains",
+                "Sample Subjects", "Sample Message IDs"]
+    for col, name in enumerate(headers8, start=1):
+        c = ws8.cell(row=1, column=col, value=name)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    r_idx = 2
+
+    def email_sort_key(item):
+        e, entries = item
+        is_func = any(f for _, f in entries)
+        return (0 if is_func else 1, -len(entries))
+
+    for e, entries in sorted(email_map.items(), key=email_sort_key):
+        items = [r for r, f in entries]
+        is_functional = any(f for _, f in entries)
+        doms = sorted(set(it["from_domain"] for it in items if it["from_domain"]))
+        subs = " | ".join(it["subject"][:60] for it in items[:4])
+        ids = ", ".join(it["id"] for it in items[:6])
+        conf_label = "functional" if is_functional else "filler"
+        conf_fill = FUNCTIONAL_FILL if is_functional else FILLER_FILL
+        conf_font = FUNCTIONAL_FONT if is_functional else FILLER_FONT
+        ws8.cell(row=r_idx, column=1, value=e).font = CELL_FONT
+        c_conf = ws8.cell(row=r_idx, column=2, value=conf_label)
+        c_conf.font = conf_font
+        c_conf.fill = conf_fill
+        ws8.cell(row=r_idx, column=3, value=len(items)).font = CELL_FONT
+        ws8.cell(row=r_idx, column=4, value=len(doms)).font = CELL_FONT
+        ws8.cell(row=r_idx, column=5, value=subs).font = CELL_FONT
+        ws8.cell(row=r_idx, column=5).alignment = WRAP
+        ws8.cell(row=r_idx, column=6, value=ids).font = CELL_FONT
+        r_idx += 1
+    ws8.freeze_panes = "A2"
+    if r_idx > 2:
+        ws8.auto_filter.ref = f"A1:F{r_idx-1}"
+    ws8.column_dimensions["A"].width = 30
+    ws8.column_dimensions["B"].width = 12
+    ws8.column_dimensions["C"].width = 12
+    ws8.column_dimensions["D"].width = 20
+    ws8.column_dimensions["E"].width = 60
+    ws8.column_dimensions["F"].width = 40
+
+    # ---- Wallets (crypto addresses found in message bodies) ----
+    ws_wallets = wb.create_sheet("Wallets")
+    wallet_map = defaultdict(list)
+    for r in rows:
+        for w in (r.get("btc_addresses") or "").split(";"):
+            w = w.strip()
+            if w:
+                wallet_map[("BTC", w)].append(r)
+        for w in (r.get("eth_addresses") or "").split(";"):
+            w = w.strip()
+            if w:
+                wallet_map[("ETH", w)].append(r)
+    headers_w = ["Type", "Address", "Times Seen", "Distinct Sender Domains",
+                 "Sample Subjects", "Sample Message IDs"]
+    for col, name in enumerate(headers_w, start=1):
+        c = ws_wallets.cell(row=1, column=col, value=name)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    r_idx = 2
+    for (kind, w), items in sorted(wallet_map.items(), key=lambda x: -len(x[1])):
+        doms = sorted(set(it["from_domain"] for it in items if it["from_domain"]))
+        subs = " | ".join(it["subject"][:60] for it in items[:4])
+        ids = ", ".join(it["id"] for it in items[:6])
+        ws_wallets.cell(row=r_idx, column=1, value=kind).font = CELL_FONT
+        ws_wallets.cell(row=r_idx, column=2, value=w).font = CELL_FONT
+        ws_wallets.cell(row=r_idx, column=3, value=len(items)).font = CELL_FONT
+        ws_wallets.cell(row=r_idx, column=4, value=len(doms)).font = CELL_FONT
+        c_subs = ws_wallets.cell(row=r_idx, column=5, value=subs)
+        c_subs.font = CELL_FONT
+        c_subs.alignment = WRAP
+        ws_wallets.cell(row=r_idx, column=6, value=ids).font = CELL_FONT
+        r_idx += 1
+    ws_wallets.freeze_panes = "A2"
+    if r_idx > 2:
+        ws_wallets.auto_filter.ref = f"A1:F{r_idx-1}"
+    ws_wallets.column_dimensions["A"].width = 8
+    ws_wallets.column_dimensions["B"].width = 42
+    ws_wallets.column_dimensions["C"].width = 12
+    ws_wallets.column_dimensions["D"].width = 20
+    ws_wallets.column_dimensions["E"].width = 60
+    ws_wallets.column_dimensions["F"].width = 40
+
+    # ---- Operator Fingerprints (contacts/phones/wallets reused across domains) ----
+    # A value that shows up in messages sent from 2+ different (often
+    # random-string, disposable) sender domains is a much stronger signal
+    # than domain repetition alone -- it suggests the same operator/kit
+    # reusing one real identifier across many burner domains. Wallets carry
+    # the strongest signal (real cost to replace); emails/phones keep their
+    # functional/filler confidence label since spam bodies sometimes stuff
+    # in unrelated PII as noise (see ioc_lib.classify_contacts/classify_phones).
+    ws6 = wb.create_sheet("Operator Fingerprints")
+    headers6 = ["Type", "Value", "Confidence", "Distinct Sender Domains", "Example Sender Domains"]
+    for col, name in enumerate(headers6, start=1):
+        c = ws6.cell(row=1, column=col, value=name)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+
+    fingerprints = []  # (type, value, confidence_label, domains, sort_rank)
+    for p, entries in phone_map.items():
+        doms = sorted(set(it["from_domain"] for it, _ in entries if it["from_domain"]))
+        if len(doms) < 2:
+            continue
+        is_functional = any(f for _, f in entries)
+        fingerprints.append(("phone", p, "functional" if is_functional else "filler", doms,
+                              1 if is_functional else 2))
+    for e, entries in email_map.items():
+        doms = sorted(set(it["from_domain"] for it, _ in entries if it["from_domain"]))
+        if len(doms) < 2:
+            continue
+        is_functional = any(f for _, f in entries)
+        fingerprints.append(("email", e, "functional" if is_functional else "filler", doms,
+                              1 if is_functional else 2))
+    for (kind, w), items in wallet_map.items():
+        doms = sorted(set(it["from_domain"] for it in items if it["from_domain"]))
+        if len(doms) < 2:
+            continue
+        fingerprints.append((kind, w, "wallet", doms, 0))
+
+    fingerprints.sort(key=lambda x: (x[4], -len(x[3])))
+
+    r_idx = 2
+    for kind, value, conf_label, doms, _ in fingerprints:
+        is_strong = conf_label in ("functional", "wallet")
+        conf_fill = FUNCTIONAL_FILL if is_strong else FILLER_FILL
+        conf_font = FUNCTIONAL_FONT if is_strong else FILLER_FONT
+        ws6.cell(row=r_idx, column=1, value=kind).font = CELL_FONT
+        ws6.cell(row=r_idx, column=2, value=value).font = CELL_FONT
+        c_conf = ws6.cell(row=r_idx, column=3, value=conf_label)
+        c_conf.font = conf_font
+        c_conf.fill = conf_fill
+        ws6.cell(row=r_idx, column=4, value=len(doms)).font = CELL_FONT
+        c_ex = ws6.cell(row=r_idx, column=5, value="; ".join(doms[:8]))
+        c_ex.font = CELL_FONT
+        c_ex.alignment = WRAP
+        r_idx += 1
+    ws6.freeze_panes = "A2"
+    if r_idx > 2:
+        ws6.auto_filter.ref = f"A1:E{r_idx-1}"
+    ws6.column_dimensions["A"].width = 10
+    ws6.column_dimensions["B"].width = 36
+    ws6.column_dimensions["C"].width = 14
+    ws6.column_dimensions["D"].width = 20
+    ws6.column_dimensions["E"].width = 70
+
+    # ---- Summary: cross-campaign signals (filled in now that the other
+    # tabs' data is available) ----
+    row += 2
+    ws.cell(row=row, column=2, value="Cross-campaign signals").font = Font(name=FONT, bold=True, size=11)
+    row += 1
+    ws.cell(row=row, column=2, value="Body-template clusters (2+ messages sharing a template)").font = CELL_FONT
+    ws.cell(row=row, column=3, value=len(template_clusters)).font = CELL_FONT
+    row += 1
+    ws.cell(row=row, column=2, value="Operator fingerprints (contact/phone/wallet reused across domains)").font = CELL_FONT
+    ws.cell(row=row, column=3, value=len(fingerprints)).font = CELL_FONT
+
+    if brand_map:
+        row += 2
+        ws.cell(row=row, column=2, value="Top impersonated brands").font = Font(name=FONT, bold=True, size=11)
+        row += 1
+        ws.cell(row=row, column=2, value="Brand").font = HEADER_FONT
+        ws.cell(row=row, column=2).fill = HEADER_FILL
+        ws.cell(row=row, column=3, value="Count").font = HEADER_FONT
+        ws.cell(row=row, column=3).fill = HEADER_FILL
+        for b, items in sorted(brand_map.items(), key=lambda x: -len(x[1]))[:10]:
+            row += 1
+            ws.cell(row=row, column=2, value=b).font = CELL_FONT
+            ws.cell(row=row, column=3, value=len(items)).font = CELL_FONT
+
+    os.makedirs(os.path.dirname(OUT_XLSX), exist_ok=True)
+    wb.save(OUT_XLSX)
+    print(f"Saved {OUT_XLSX} ({len(rows)} total rows, {cat_counts.get('likely_scam', 0)} flagged likely_scam)")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,2 +1,207 @@
-# spam-email-analyzer
-Analyzes spam emails to find artifacts, detect trends, and identify spam senders
+# Scam Email Tracker
+
+A toolkit for extracting indicators of compromise (IOCs) from spam/scam
+emails, triaging them, and compiling them into a running spreadsheet report.
+
+## How it works
+
+This is a batch tool, not a live service. Drop email files into
+`data/input/`, run `process_mail.py`, then `build_master_report.py`.
+
+`process_mail.py`:
+
+- Extracts IOCs from every `.eml`/`.mbox` file in `data/input/`.
+- appends new rows to `data/master_iocs.csv` / `data/master_urls.csv`,
+  deduping by a hash of each message's `Message-ID`. Re-running
+  against an export that overlaps with what you've already ingested (e.g.
+  a mailbox export that always includes everything, not just what's new)
+  is safe.
+- Moves processed files into a dated, zipped archive under
+  `data/scanned/` (e.g. `data/scanned/2026-07-25.zip`). Running the tool
+  more than once in a day adds a `_2`, `_3`, etc. suffix instead of
+  overwriting that day's zip.
+
+`build_master_report.py` rebuilds `output/master_report.xlsx` from those
+CSVs. A full rebuild every time, not an append, so the CSVs are always
+the source of truth.
+
+Getting mail into `data/input/` in the first place is up to you. A manual
+download/export is enough. If you want it automated (an IMAP poller, a
+cron job, a scheduled export), that's a separate concern this repo
+doesn't try to solve. Any process that drops `.eml`/`.mbox` files into
+`data/input/` works.
+
+## Where data lives
+
+`data/master_iocs.csv` and `data/master_urls.csv` are the source of truth
+for everything downstream. `build_master_report.py` reads only from
+them, never the original emails. You don't need to keep the raw
+`.eml`/`.mbox` files after ingesting them unless you want to re-pull full
+original headers later (e.g. for an abuse report). They're preserved,
+zipped by day, in `data/scanned/` either way.
+
+## What it does
+
+1. **Extract**: Sender info, SPF/DKIM/DMARC, originating IPs, URLs,
+   phone numbers, crypto wallet addresses, and contact emails from the
+   body. This includes ones hidden with cheap obfuscation tricks like
+   `name (at) domain (dot) com`, zero-width characters, or Cyrillic
+   look-alike letters (`ioc_lib.deobfuscate`).
+2. **Triage**: Rule-based and no LLM/API calls. It sorts each email into
+   `likely_scam`, `review`, or `bulk_marketing`. It then separately tags which
+   brand or institution it appears to be impersonating
+   (`ioc_lib.IMPERSONATED_BRANDS`).
+3. **Classify confidence**: Phone numbers and contact emails are split
+   into `functional` (real call-to-action language) vs `filler`
+   (word-salad/camouflage noise). See `ioc_lib.classify_contacts` and
+   `classify_phones`.
+4. **Fingerprint the body template**: A SimHash of the body with the
+   parts that vary per-blast (URLs, contacts, wallets) stripped out, so
+   campaigns sharing a template get linked even across different senders
+   with different contact info (`ioc_lib.body_template_fingerprint`).
+5. **Report**: A formatted `.xlsx` with tabs for the full email list,
+   domain clustering, WHOIS enrichment, a brand-impersonation breakdown,
+   template clusters, and "Operator Fingerprints". Any contact email,
+   phone number, or crypto wallet that repeats across 2+ sender domains,
+   the strongest signal this dataset can surface that messages trace back
+   to the same operator.
+
+## Files
+
+| File                     | Purpose                                                                                                                                                        |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ioc_lib.py`             | Shared extraction + triage logic. Everything else imports this.                                                                                                |
+| `process_mail.py`        | Main entry point. Ingests every `.eml`/`.mbox` file in `data/input/` and moves it into a dated, zipped archive under `data/scanned/` once it's been processed. |
+| `build_master_report.py` | Rebuilds the formatted `.xlsx` report from the running CSV. Safe to re-run any time -- a full rebuild, not an append.                                          |
+| `lookup_domains.py`      | Optional. Runs WHOIS lookups for sender domains and appends the results to `data/domain_enrichment.csv`, with a delay between requests.                        |
+
+## Setup
+
+```bash
+pip install -r requirements.txt
+```
+
+### Analyze emails
+
+Put email files into `data/input/`. They can be individual `.eml` files, a `.mbox`
+export, or both. Then run:
+
+```bash
+python3 process_mail.py
+```
+
+This extracts IOCs from every file in `data/input/`, appends new rows to
+the master CSVs, and moves each processed file into
+`data/scanned/<today's date>/`, which then gets zipped and removed.
+`data/input/` and the day's raw files are both empty/gone by the time the
+run finishes.
+
+If you're monitoring more than one mailbox, drop each one's exports into
+its own subfolder (e.g. `data/input/work/`, `data/input/personal/`).
+The subfolder name is recorded as that row's `source`, so the report can
+tell them apart later. Files placed directly in `data/input/` get a
+default `source` of `input`.
+
+Once the CSVs are updated, build the report:
+
+```bash
+python3 build_master_report.py
+```
+
+Outputs `output/master_report.xlsx`.
+
+### Excluding your own addresses (recommended)
+
+`ioc_lib.py` excludes your own email addresses from
+`contact_emails_in_body` -- otherwise every "Dear you@example.com" salutation
+gets extracted as if it were an attacker-controlled contact. Copy
+`data/self_addresses_example.txt` to `data/self_addresses.txt` (gitignored)
+and list your own addresses, one per line:
+
+```
+you@example.com
+you@your-other-provider.example
+```
+
+If `data/self_addresses.txt` doesn't exist, nothing gets excluded this
+way -- it just means your own addresses may show up as false-positive
+"contacts found in body."
+
+### Domain enrichment (optional)
+
+`data/domain_enrichment.csv` holds WHOIS notes per domain (registration
+date, registrar, anything else worth noting) that `build_master_report.py`
+picks up automatically, highlighting matches in "Domain Clusters" and
+listing everything in its own "Domain Enrichment" tab. Copy
+`data/domain_enrichment_example.csv` to `data/domain_enrichment.csv`
+(gitignored -- it's your own research) to get started, same format as the
+example:
+
+```csv
+domain,registered_date,registrar,notes
+```
+
+You can fill it in by hand, or run `lookup_domains.py` to do it via WHOIS:
+
+```bash
+python3 lookup_domains.py
+```
+
+By default this only looks up sender domains that showed up in 2+
+messages (same threshold "Domain Clusters" uses) and skips any domain
+already in `data/domain_enrichment.csv`, waiting 8 seconds between each
+lookup so as not to hammer WHOIS servers (many rate-limit or temporarily
+block IPs that query too fast). `--all` looks up every sender domain
+instead of just repeat ones, `--delay N` changes the wait, and `--limit N`
+caps how many it does in one run. The `notes` column is always left blank
+for you to fill in yourself.
+
+## Known limitations
+
+- Keyword-based triage, brand detection, and deobfuscation are all
+  pattern-based, not exhaustive
+  - Triage/brand tuning lives in `ioc_lib.py` (`URGENT_KEYWORDS`, `KNOWN_LEGIT_DOMAINS`,
+    `IMPERSONATED_BRANDS`) and needs occasional updates as new patterns show
+    up. Deobfuscation (`ioc_lib.deobfuscate`) only undoes a handful of known
+    tricks (`[at]`/`[dot]`, zero-width characters, a small set of
+    Cyrillic/Greek look-alikes). It's not a general Unicode-confusables
+    solution. None of this can see text embedded in images (e.g. a brand
+    logo rendered as a picture rather than plain text).
+- Phone/email extraction is regex-based
+  - It is not a full NLP pipeline. It's tuned to reduce false positives
+    (e.g. tracking/order numbers being mistaken for phone numbers)
+    but won't be perfect on unusual formats.
+- The functional/filler contact classifier is a heuristic, not ground truth
+  - It's meant to cut down on wasted effort chasing camouflage text,
+    not to make the final call for you. Double check results before filing
+    an abuse report.
+- Template clustering is approximate:
+  - It compares SimHash fingerprints with an O(n^2) pairwise comparison,
+    which is fine at personal-mailbox scale but would need banding to stay
+    fast on a much larger dataset. The distance threshold
+    (`build_master_report.TEMPLATE_HAMMING_THRESHOLD`) acts as a tuning knob.
+    Tighten it if unrelated messages end up in the same
+    cluster or loosen it if near-identical templates aren't matching.
+- No built-in automation for getting mail into `data/input/`
+  - This is deliberate (see "How it works" above), so live/continuous monitoring is
+    something you'd need to build yourself.
+- Same-day zips share an internal folder name
+  - `data/scanned/2026-07-25.zip` and `data/scanned/2026-07-25_2.zip`
+    (if you ran the tool twice in one day) both contain a top-level `2026-07-25/`
+    folder. Extracting both into the same destination at once will collide.
+    Extract them one at a time, or to separate destinations, if that ever comes up.
+- `lookup_domains.py` results vary by registry/registrar
+  - Some WHOIS servers rate-limit or block regardless of the delay between
+    requests, some TLDs redact registrant/registrar info by default, and
+    responses aren't perfectly standardized across registrars -- expect
+    occasional blank or missing fields rather than a failure.
+
+## Privacy note
+
+This repo intentionally does not include any actual email data or
+extracted IOCs. See `.gitignore`. If you fork this for your own use,
+please keep it this way. `data/` and `output/` contain personal information (or,
+in the report's case, indicators that could be considered evidence if
+you're using this for abuse reporting) and shouldn't be committed to a
+public repo. The one exception is `data/domain_enrichment_example.csv`,
+which is just a format template with no personal data.
