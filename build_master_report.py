@@ -18,6 +18,7 @@ MASTER_CSV = os.path.join(BASE, "data", "master_iocs.csv")
 MASTER_URLS_CSV = os.path.join(BASE, "data", "master_urls.csv")
 ENRICHMENT_CSV = os.path.join(BASE, "data", "domain_enrichment.csv")
 WALLET_ENRICHMENT_CSV = os.path.join(BASE, "data", "wallet_enrichment.csv")
+WALLET_TRANSACTIONS_CSV = os.path.join(BASE, "data", "wallet_transactions.csv")
 IP_ENRICHMENT_CSV = os.path.join(BASE, "data", "ip_enrichment.csv")
 OUT_XLSX = os.path.join(BASE, "output", "master_report.xlsx")
 
@@ -28,6 +29,20 @@ def load_wallet_enrichment():
         return {}
     with open(WALLET_ENRICHMENT_CSV, encoding="utf-8") as f:
         return {r["address"]: r for r in csv.DictReader(f)}
+
+
+def load_wallet_transactions():
+    """Per-transaction detail built by lookup_wallets.py, grouped by
+    address -- this is what an IC3/law-enforcement report actually needs
+    (txid, timestamp, amount, counterparty), not just the summary stats in
+    wallet_enrichment.csv."""
+    if not os.path.exists(WALLET_TRANSACTIONS_CSV):
+        return defaultdict(list)
+    by_addr = defaultdict(list)
+    with open(WALLET_TRANSACTIONS_CSV, encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            by_addr[r["address"]].append(r)
+    return by_addr
 
 
 def load_ip_enrichment():
@@ -638,6 +653,7 @@ def main():
     ACTIVE_FILL = PatternFill("solid", fgColor="FFC7CE")
     ACTIVE_FONT = Font(name=FONT, size=10, bold=True, color="9C0006")
     wallet_enrichment = load_wallet_enrichment()
+    wallet_transactions = load_wallet_transactions()
     ws_wallets = wb.create_sheet("Wallets")
     wallet_map = defaultdict(list)
     for r in rows:
@@ -701,6 +717,48 @@ def main():
         ws_wallets.auto_filter.ref = f"A1:L{r_idx-1}"
     for col_letter, w_ in zip("ABCDEFGHIJKL", (8, 42, 12, 12, 12, 18, 16, 13, 13, 12, 50, 40)):
         ws_wallets.column_dimensions[col_letter].width = w_
+
+    # ---- Wallet Transactions (per-tx detail for law-enforcement reports) ----
+    # IC3's crypto-fraud form asks for transaction ID, timestamp, amount,
+    # and counterparty address -- not just "this wallet is active", which
+    # is all the Wallets tab summarizes. One row per transaction, built by
+    # lookup_wallets.py. Incoming transactions (funds received by the scam
+    # wallet, i.e. from a victim or an intermediary) are highlighted --
+    # those are the ones a report should center on; outgoing rows show
+    # where the money moved on to next, useful for tracing further hops.
+    ws_tx = wb.create_sheet("Wallet Transactions")
+    headers_tx = ["Address", "Chain", "Transaction ID", "Timestamp", "Block Height",
+                  "Direction", "Amount", "Counterparty Address(es)", "Confirmed",
+                  "Explorer Link"]
+    for col, name in enumerate(headers_tx, start=1):
+        c = ws_tx.cell(row=1, column=col, value=name)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    r_idx = 2
+    all_tx_rows = sorted(
+        (r for recs in wallet_transactions.values() for r in recs),
+        key=lambda r: (r.get("address", ""), r.get("timestamp", "")),
+    )
+    for r in all_tx_rows:
+        is_incoming = r.get("direction") == "in"
+        values_tx = [r.get("address", ""), r.get("chain", ""), r.get("txid", ""),
+                     r.get("timestamp", ""), r.get("block_height", ""),
+                     r.get("direction", ""), r.get("amount", ""),
+                     r.get("counterparty_addresses", ""), r.get("confirmed", ""),
+                     r.get("tx_explorer_url", "")]
+        for col, val in enumerate(values_tx, start=1):
+            c = ws_tx.cell(row=r_idx, column=col, value=val)
+            c.font = FUNCTIONAL_FONT if is_incoming else CELL_FONT
+            if is_incoming:
+                c.fill = FUNCTIONAL_FILL
+            if col == 8:
+                c.alignment = WRAP
+        r_idx += 1
+    ws_tx.freeze_panes = "A2"
+    if r_idx > 2:
+        ws_tx.auto_filter.ref = f"A1:J{r_idx-1}"
+    for col_letter, w_ in zip("ABCDEFGHIJ", (36, 8, 68, 22, 12, 10, 16, 68, 10, 46)):
+        ws_tx.column_dimensions[col_letter].width = w_
 
     # ---- Images (attachment/inline image hashes) ----
     # Keyed by byte hash (sha256, truncated); a perceptual hash column links

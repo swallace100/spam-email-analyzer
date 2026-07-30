@@ -240,6 +240,18 @@ These are read-only lookups of public ledger data. No interaction with the
 scammer or their wallet occurs, and none should: never reply, click,
 or transact -- collect, document, and report.
 
+For any wallet with on-chain activity, `lookup_wallets.py` also fetches
+every individual transaction into `data/wallet_enrichment.csv`'s sibling
+`data/wallet_transactions.csv` -- transaction ID, timestamp, amount,
+direction, and the counterparty address on the other side of each
+transaction. This is the level of detail a law-enforcement crypto-fraud
+report (e.g. IC3) actually asks for; the summary stats in
+`wallet_enrichment.csv` alone aren't enough. The report's "Wallet
+Transactions" tab lists the same data, with incoming transactions
+(funds received by the scam wallet) highlighted -- outgoing rows show
+where the money moved on next, which is worth including in a report too
+since it's the next hop in the trail.
+
 ## Known limitations
 
 - Keyword-based triage, brand detection, and deobfuscation are all

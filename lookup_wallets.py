@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Look up on-chain activity for crypto wallet addresses extracted from
-scam emails and append the results to data/wallet_enrichment.csv, skipping
-addresses already recorded there.
+scam emails and append the results to data/wallet_enrichment.csv (summary
+stats) and data/wallet_transactions.csv (one row per actual transaction),
+skipping addresses already recorded there.
 
 Why: everything else in a spam email is disposable, but the blockchain is
 public and permanent. A wallet that has actually RECEIVED money proves the
 campaign has victims, which is exactly what makes an IC3/law-enforcement
-report actionable. This uses free, no-API-key endpoints:
+report actionable -- and IC3's crypto-fraud form specifically asks for
+per-transaction metadata (transaction ID, timestamp, amount, counterparty
+address), not just a summary. That's what wallet_transactions.csv holds.
+This uses free, no-API-key endpoints:
 
   BTC: blockstream.info  (public Esplora API)
   ETH: eth.blockscout.com (public Blockscout API)
@@ -22,7 +26,9 @@ Usage:
     python3 lookup_wallets.py --limit 20   # only do 20 this run
     python3 lookup_wallets.py --recheck    # re-query addresses already
                                            # enriched (activity changes over
-                                           # time; old rows get replaced)
+                                           # time; old rows -- both summary
+                                           # and per-transaction -- get
+                                           # replaced)
 """
 
 import argparse
@@ -31,7 +37,9 @@ import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from collections import defaultdict
 from datetime import date, datetime, timezone
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -42,6 +50,12 @@ ENRICHMENT_FIELDNAMES = [
     "first_seen", "last_seen", "checked_date", "explorer_url",
     "chainabuse_url", "notes",
 ]
+TRANSACTIONS_CSV = os.path.join(BASE, "data", "wallet_transactions.csv")
+TRANSACTIONS_FIELDNAMES = [
+    "address", "chain", "txid", "timestamp", "block_height", "direction",
+    "amount", "counterparty_addresses", "confirmed", "tx_explorer_url",
+]
+TX_FETCH_CAP = 1000  # safety cap on how many transactions to pull per address
 
 DEFAULT_DELAY_SECONDS = 2
 USER_AGENT = "scam-email-tracker (personal abuse-reporting research)"
@@ -55,6 +69,10 @@ def _get_json(url, timeout=20):
 
 def _ts_to_date(ts):
     return datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
+
+
+def _ts_to_iso(ts):
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def lookup_btc(addr):
@@ -81,6 +99,117 @@ def lookup_btc(addr):
         "first_seen": first_seen,
         "last_seen": last_seen,
         "explorer_url": f"https://blockstream.info/address/{addr}",
+    }
+
+
+def fetch_btc_txs(addr, cap=TX_FETCH_CAP):
+    """All transactions touching addr, newest first. The Esplora API returns
+    the most recent 50 mempool + 25 confirmed txs from /txs, then requires
+    paging older confirmed ones via /txs/chain/<last_confirmed_txid>."""
+    all_txs = []
+    last_confirmed_txid = None
+    while True:
+        if last_confirmed_txid is None:
+            url = f"https://blockstream.info/api/address/{addr}/txs"
+        else:
+            url = f"https://blockstream.info/api/address/{addr}/txs/chain/{last_confirmed_txid}"
+        page = _get_json(url)
+        if not page:
+            break
+        all_txs.extend(page)
+        confirmed_in_page = [t for t in page if t.get("status", {}).get("confirmed")]
+        if len(confirmed_in_page) < 25 or len(all_txs) >= cap:
+            break
+        last_confirmed_txid = confirmed_in_page[-1]["txid"]
+        time.sleep(0.3)
+    seen, deduped = set(), []
+    for t in all_txs:
+        if t["txid"] not in seen:
+            seen.add(t["txid"])
+            deduped.append(t)
+    return deduped[:cap]
+
+
+def parse_btc_tx(tx, addr):
+    """One transaction -> a flat record from addr's point of view. UTXO
+    transactions don't have a single 'from'/'to' like account-based chains,
+    so direction/amount/counterparty are all computed relative to addr:
+    received = addr's share of the outputs, sent = addr's share of the
+    inputs, counterparty = the addresses on the other side of that net
+    flow (senders for an incoming payment, recipients for an outgoing one)."""
+    vins, vouts = tx.get("vin", []), tx.get("vout", [])
+    received = sum(v.get("value", 0) for v in vouts
+                   if v.get("scriptpubkey_address") == addr)
+    sent = sum(v.get("prevout", {}).get("value", 0) for v in vins
+               if v.get("prevout", {}).get("scriptpubkey_address") == addr)
+    net = received - sent
+    direction = "in" if net > 0 else ("out" if net < 0 else "self")
+    if direction == "in":
+        counterparties = sorted({
+            v.get("prevout", {}).get("scriptpubkey_address") for v in vins
+            if v.get("prevout", {}).get("scriptpubkey_address")
+            and v["prevout"]["scriptpubkey_address"] != addr
+        })
+    elif direction == "out":
+        counterparties = sorted({
+            v.get("scriptpubkey_address") for v in vouts
+            if v.get("scriptpubkey_address") and v["scriptpubkey_address"] != addr
+        })
+    else:
+        counterparties = []
+    status = tx.get("status", {})
+    confirmed = bool(status.get("confirmed"))
+    return {
+        "txid": tx.get("txid", ""),
+        "timestamp": _ts_to_iso(status["block_time"]) if confirmed else "",
+        "block_height": status.get("block_height", "") if confirmed else "",
+        "direction": direction,
+        "amount": f"{abs(net) / 1e8:.8f} BTC",
+        "counterparty_addresses": "; ".join(counterparties),
+        "confirmed": confirmed,
+        "tx_explorer_url": f"https://blockstream.info/tx/{tx.get('txid', '')}",
+    }
+
+
+def fetch_eth_txs(addr, cap=TX_FETCH_CAP):
+    """All transactions for addr via Blockscout, newest first, following
+    next_page_params until exhausted or cap is hit."""
+    items = []
+    base_url = f"https://eth.blockscout.com/api/v2/addresses/{addr}/transactions"
+    url = base_url
+    while True:
+        page = _get_json(url)
+        batch = page.get("items", [])
+        items.extend(batch)
+        next_params = page.get("next_page_params")
+        if not next_params or len(items) >= cap:
+            break
+        qs = urllib.parse.urlencode(next_params)
+        url = f"{base_url}?{qs}"
+        time.sleep(0.3)
+    return items[:cap]
+
+
+def parse_eth_tx(tx, addr):
+    addr_l = addr.lower()
+    frm = ((tx.get("from") or {}).get("hash") or "").lower()
+    to = ((tx.get("to") or {}).get("hash") or "").lower()
+    value_wei = int(tx.get("value") or 0)
+    if to == addr_l and frm != addr_l:
+        direction, counterparty = "in", frm
+    elif frm == addr_l:
+        direction, counterparty = "out", to
+    else:
+        direction, counterparty = "self", ""
+    return {
+        "txid": tx.get("hash", ""),
+        "timestamp": tx.get("timestamp", ""),
+        "block_height": tx.get("block_number", tx.get("block", "")),
+        "direction": direction,
+        "amount": f"{value_wei / 1e18:.6f} ETH",
+        "counterparty_addresses": counterparty,
+        "confirmed": (tx.get("status") == "ok"),
+        "tx_explorer_url": f"https://eth.blockscout.com/tx/{tx.get('hash', '')}",
     }
 
 
@@ -138,6 +267,21 @@ def write_enrichment(rows):
             writer.writerow({k: r.get(k, "") for k in ENRICHMENT_FIELDNAMES})
 
 
+def load_transaction_rows():
+    if not os.path.exists(TRANSACTIONS_CSV):
+        return []
+    with open(TRANSACTIONS_CSV, encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def write_transactions(rows):
+    with open(TRANSACTIONS_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=TRANSACTIONS_FIELDNAMES)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({k: r.get(k, "") for k in TRANSACTIONS_FIELDNAMES})
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -164,6 +308,11 @@ def main():
         print("Nothing new to look up.")
         return
 
+    existing_txs = load_transaction_rows()
+    tx_by_addr = defaultdict(list)
+    for r in existing_txs:
+        tx_by_addr[r["address"]].append(r)
+
     print(f"Looking up {len(todo)} wallet(s), waiting {args.delay}s between each...")
     results = {r["address"]: r for r in existing}
     ok = 0
@@ -184,6 +333,19 @@ def main():
             print(f"  [{i + 1}/{len(todo)}] {chain} {addr}: "
                   f"txs={data['tx_count']} received={data['total_received'] or 'n/a'} "
                   f"balance={data['balance']}{active}")
+
+            # Per-transaction detail -- this is what IC3's crypto-fraud form
+            # actually asks for (txid/timestamp/amount/counterparty), not
+            # just the summary stats above.
+            if data["tx_count"]:
+                raw_txs = fetch_btc_txs(addr) if chain == "BTC" else fetch_eth_txs(addr)
+                parse_fn = parse_btc_tx if chain == "BTC" else parse_eth_tx
+                tx_records = []
+                for raw in raw_txs:
+                    rec = parse_fn(raw, addr)
+                    tx_records.append({"address": addr, "chain": chain, **rec})
+                tx_by_addr[addr] = tx_records
+                print(f"      -> saved {len(tx_records)} transaction(s) to {os.path.basename(TRANSACTIONS_CSV)}")
         except Exception as e:
             print(f"  [{i + 1}/{len(todo)}] {chain} {addr}: lookup failed ({e})")
         if i < len(todo) - 1:
@@ -195,7 +357,18 @@ def main():
         ordered += [r for a, r in results.items() if a not in {c for c, _ in candidates}]
         write_enrichment(ordered)
         print(f"Wrote {len(ordered)} row(s) to {ENRICHMENT_CSV}")
-        print("Run build_master_report.py to pull this into the Wallets tab.")
+
+        tx_ordered = []
+        for a, _ in candidates:
+            tx_ordered += tx_by_addr.get(a, [])
+        known = {a for a, _ in candidates}
+        for a, recs in tx_by_addr.items():
+            if a not in known:
+                tx_ordered += recs
+        write_transactions(tx_ordered)
+        print(f"Wrote {len(tx_ordered)} transaction row(s) to {TRANSACTIONS_CSV}")
+        print("Run build_master_report.py to pull this into the Wallets / "
+              "Wallet Transactions tabs.")
     else:
         print("No successful lookups to add.")
 
