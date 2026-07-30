@@ -4,6 +4,7 @@ Shared IOC extraction + triage logic, used by process_mail.py.
 
 import csv
 import io
+import ipaddress
 import os
 import re
 import email.utils
@@ -492,13 +493,22 @@ def get_body_text(msg):
 
 
 def extract_ips(received_headers):
+    """Public IPs from the Received chain, in header order (first = the hop
+    closest to you, last = closest to the true origin). Candidates are
+    validated with ipaddress -- the bare regex also matches version strings
+    like '15.21.270.5' -- and private/reserved relay hops are dropped."""
     ip_re = re.compile(r'\[?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\]?')
     ips = []
     for h in received_headers:
         for m in ip_re.finditer(h):
             ip = m.group(1)
-            if ip not in ips:
-                ips.append(ip)
+            if ip in ips:
+                continue
+            try:
+                if ipaddress.ip_address(ip).is_global:
+                    ips.append(ip)
+            except ValueError:
+                continue
     return ips
 
 

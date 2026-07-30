@@ -94,7 +94,9 @@ zipped by day, in `data/scanned/` either way.
 | `ioc_lib.py`             | Shared extraction + triage logic. Everything else imports this.                                                                                                |
 | `process_mail.py`        | Main entry point. Ingests every `.eml`/`.mbox` file in `data/input/` and moves it into a dated, zipped archive under `data/scanned/` once it's been processed. |
 | `build_master_report.py` | Rebuilds the formatted `.xlsx` report from the running CSV. Safe to re-run any time -- a full rebuild, not an append.                                          |
-| `lookup_domains.py`      | Optional. Runs WHOIS lookups for sender domains and appends the results to `data/domain_enrichment.csv`, with a delay between requests.                        |
+| `lookup_domains.py`      | Optional. Runs WHOIS lookups for sender domains (registration date, registrar, nameservers, registrant) into `data/domain_enrichment.csv`, with a delay between requests. |
+| `lookup_wallets.py`      | Optional. Looks up on-chain activity for extracted crypto wallets (free public APIs, no key) and writes `data/wallet_enrichment.csv` for the Wallets tab.      |
+| `lookup_ips.py`          | Optional. Maps originating IPs to ASN/hosting provider/country via ip-api.com's free batch endpoint, into `data/ip_enrichment.csv` for the Origin ASNs tab.   |
 
 ## Setup
 
@@ -185,6 +187,58 @@ block IPs that query too fast). `--all` looks up every sender domain
 instead of just repeat ones, `--delay N` changes the wait, and `--limit N`
 caps how many it does in one run. The `notes` column is always left blank
 for you to fill in yourself.
+
+### IP enrichment (optional)
+
+Sender domains are disposable, but the machines the mail transits are
+rented from real hosting providers. `lookup_ips.py` maps every public
+originating IP to its ASN, hosting provider, and country via ip-api.com's
+free batch endpoint (no key; HTTP-only free tier, rate-limited -- the
+script stays under the limit automatically):
+
+```bash
+python3 lookup_ips.py
+```
+
+The report's "Origin ASNs" tab then aggregates messages by the ASN of
+their best-guess origin IP (the deepest public hop in each Received
+chain). Concentration there is a reportable pattern -- a hosting provider
+carrying a large share of your scam volume has an abuse desk that should
+hear about it. Caveat: Received headers below the hop your own provider
+recorded can be forged, so treat origins as strong hints, not proof.
+
+The WHOIS side feeds a second correlation: `lookup_domains.py` now also
+records nameservers and registrant org/country, and the "Registration
+Clusters" tab groups enriched domains sharing registrar + nameserver
+infrastructure. Burner domains bought at the same registrar, parked on the
+same nameservers, registered within days of each other, are one operator's
+shopping trip. This tab gets more useful the more domains you enrich
+(consider `lookup_domains.py --all`); a cluster spanning years on a huge
+shared platform (e.g. domaincontrol.com) is weak evidence, one spanning
+days on an obscure one is strong. Old enrichment rows from before the
+nameserver column existed can be backfilled with
+`lookup_domains.py --refill-missing`.
+
+### Wallet enrichment (optional)
+
+The blockchain is the one part of a scam email that's public and permanent.
+`lookup_wallets.py` queries free, no-API-key explorers (Blockstream for
+BTC, Blockscout for ETH) for each extracted wallet's transaction count,
+total received, and balance, writing `data/wallet_enrichment.csv`
+(gitignored). The report's Wallets tab picks it up automatically and sorts
+wallets with real on-chain activity to the top, highlighted -- a wallet
+that has actually received funds proves the campaign has victims, which is
+what makes an IC3 (ic3.gov) or [Chainabuse](https://chainabuse.com) report
+actionable.
+
+```bash
+python3 lookup_wallets.py            # new wallets only
+python3 lookup_wallets.py --recheck  # refresh previously checked ones
+```
+
+These are read-only lookups of public ledger data. No interaction with the
+scammer or their wallet occurs, and none should: never reply, click,
+or transact -- collect, document, and report.
 
 ## Known limitations
 

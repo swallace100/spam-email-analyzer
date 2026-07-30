@@ -5,8 +5,10 @@ so the CSV is always the source of truth."""
 
 import csv
 import email.utils
+import ipaddress
 import os
 from collections import Counter, defaultdict
+from datetime import date
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
@@ -15,7 +17,41 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 MASTER_CSV = os.path.join(BASE, "data", "master_iocs.csv")
 MASTER_URLS_CSV = os.path.join(BASE, "data", "master_urls.csv")
 ENRICHMENT_CSV = os.path.join(BASE, "data", "domain_enrichment.csv")
+WALLET_ENRICHMENT_CSV = os.path.join(BASE, "data", "wallet_enrichment.csv")
+IP_ENRICHMENT_CSV = os.path.join(BASE, "data", "ip_enrichment.csv")
 OUT_XLSX = os.path.join(BASE, "output", "master_report.xlsx")
+
+
+def load_wallet_enrichment():
+    """On-chain activity per wallet, built by lookup_wallets.py."""
+    if not os.path.exists(WALLET_ENRICHMENT_CSV):
+        return {}
+    with open(WALLET_ENRICHMENT_CSV, encoding="utf-8") as f:
+        return {r["address"]: r for r in csv.DictReader(f)}
+
+
+def load_ip_enrichment():
+    """ASN/provider info per IP, built by lookup_ips.py."""
+    if not os.path.exists(IP_ENRICHMENT_CSV):
+        return {}
+    with open(IP_ENRICHMENT_CSV, encoding="utf-8") as f:
+        return {r["ip"]: r for r in csv.DictReader(f)}
+
+
+def origin_ip_of(row):
+    """Best guess at the true origin IP of a message: the LAST public IP in
+    originating_ips. extract_ips preserves Received-header order (top =
+    closest to your inbox, bottom = closest to the sender), so the last
+    entry is the deepest hop the chain records. Rows ingested before IP
+    validation may contain junk, so entries are validated here too."""
+    candidates = [ip.strip() for ip in (row.get("originating_ips") or "").split(";") if ip.strip()]
+    for ip in reversed(candidates):
+        try:
+            if ipaddress.ip_address(ip).is_global:
+                return ip
+        except ValueError:
+            continue
+    return ""
 
 
 def month_of(row):
@@ -256,27 +292,143 @@ def main():
 
     # ---- Domain Enrichment (WHOIS notes) ----
     ws5 = wb.create_sheet("Domain Enrichment")
-    headers5 = ["Domain", "Registered", "Registrar", "Notes"]
+    headers5 = ["Domain", "Registered", "Registrar", "Nameservers",
+                "Registrant Org", "Country", "Notes"]
     for col, name in enumerate(headers5, start=1):
         c = ws5.cell(row=1, column=col, value=name)
         c.font = HEADER_FONT
         c.fill = HEADER_FILL
     r_idx = 2
     for d, enr in enrichment.items():
-        ws5.cell(row=r_idx, column=1, value=d).font = CELL_FONT
-        ws5.cell(row=r_idx, column=2, value=enr["registered_date"]).font = CELL_FONT
-        ws5.cell(row=r_idx, column=3, value=enr["registrar"]).font = CELL_FONT
-        c_notes = ws5.cell(row=r_idx, column=4, value=enr["notes"])
-        c_notes.font = CELL_FONT
-        c_notes.alignment = WRAP
+        values5 = [d, enr.get("registered_date", ""), enr.get("registrar", ""),
+                   enr.get("nameservers", ""), enr.get("registrant_org", ""),
+                   enr.get("registrant_country", ""), enr.get("notes", "")]
+        for col, val in enumerate(values5, start=1):
+            c = ws5.cell(row=r_idx, column=col, value=val)
+            c.font = CELL_FONT
+            if col in (4, 7):
+                c.alignment = WRAP
         r_idx += 1
     ws5.freeze_panes = "A2"
     if r_idx > 2:
-        ws5.auto_filter.ref = f"A1:D{r_idx-1}"
-    ws5.column_dimensions["A"].width = 26
-    ws5.column_dimensions["B"].width = 14
-    ws5.column_dimensions["C"].width = 20
-    ws5.column_dimensions["D"].width = 90
+        ws5.auto_filter.ref = f"A1:G{r_idx-1}"
+    for col_letter, w_ in zip("ABCDEFG", (26, 14, 20, 40, 22, 10, 60)):
+        ws5.column_dimensions[col_letter].width = w_
+
+    # ---- Registration Clusters (domains that were bought together) ----
+    # Groups enriched domains sharing registrar + nameserver infrastructure.
+    # Burner domains registered through the same registrar, parked on the
+    # same nameservers, within days of each other, are one operator's
+    # shopping trip -- a stronger link than anything in the mail itself.
+    ws_reg = wb.create_sheet("Registration Clusters")
+
+    def ns_roots(ns_field):
+        roots = set()
+        for ns in (ns_field or "").split(";"):
+            ns = ns.strip().lower()
+            if ns:
+                parts = ns.split(".")
+                if len(parts) >= 2:
+                    roots.add(".".join(parts[-2:]))
+        return frozenset(roots)
+
+    reg_clusters = defaultdict(list)
+    for d, enr in enrichment.items():
+        registrar = (enr.get("registrar") or "").strip().lower()
+        roots = ns_roots(enr.get("nameservers"))
+        if registrar and roots:
+            reg_clusters[(registrar, roots)].append((d, enr))
+    headers_reg = ["Registrar", "Nameserver Infrastructure", "Domains", "Domain Count",
+                   "Registration Dates", "Span (days)", "Messages From These Domains"]
+    for col, name in enumerate(headers_reg, start=1):
+        c = ws_reg.cell(row=1, column=col, value=name)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    msg_count_by_domain = Counter(r["from_domain"] for r in rows if r["from_domain"])
+    r_idx = 2
+    for (registrar, roots), members in sorted(reg_clusters.items(), key=lambda x: -len(x[1])):
+        if len(members) < 2:
+            continue
+        doms = sorted(d for d, _ in members)
+        dates = sorted(e.get("registered_date", "") for _, e in members if e.get("registered_date"))
+        span = ""
+        if len(dates) >= 2:
+            try:
+                span = (date.fromisoformat(dates[-1][:10])
+                        - date.fromisoformat(dates[0][:10])).days
+            except ValueError:
+                pass
+        total_msgs = sum(msg_count_by_domain.get(d, 0) for d in doms)
+        values_reg = [registrar, "; ".join(sorted(roots)), "; ".join(doms), len(doms),
+                      ", ".join(dates), span, total_msgs]
+        for col, val in enumerate(values_reg, start=1):
+            c = ws_reg.cell(row=r_idx, column=col, value=val)
+            c.font = CELL_FONT
+            if col in (2, 3, 5):
+                c.alignment = WRAP
+        r_idx += 1
+    ws_reg.freeze_panes = "A2"
+    if r_idx > 2:
+        ws_reg.auto_filter.ref = f"A1:G{r_idx-1}"
+    for col_letter, w_ in zip("ABCDEFG", (24, 30, 50, 12, 26, 10, 14)):
+        ws_reg.column_dimensions[col_letter].width = w_
+
+    # ---- Origin ASNs (where the mail actually comes from) ----
+    # Each message's best-guess origin IP (deepest public hop in its
+    # Received chain) mapped to its ASN/hosting provider via
+    # data/ip_enrichment.csv (lookup_ips.py). Concentration here is a
+    # reportable pattern: a hoster carrying a big share of your scam volume
+    # has an abuse desk that wants (or needs) to know. Note the caveat:
+    # the Received chain can be forged below the hop your own provider
+    # recorded, so treat origins as strong hints, not proof.
+    ip_enrichment = load_ip_enrichment()
+    ws_asn = wb.create_sheet("Origin ASNs")
+    asn_map = defaultdict(list)   # asn -> [(row, ip)]
+    unenriched_ips = set()
+    for r in rows:
+        ip = origin_ip_of(r)
+        if not ip:
+            continue
+        enr = ip_enrichment.get(ip)
+        if enr and enr.get("asn"):
+            asn_map[enr["asn"]].append((r, ip))
+        else:
+            unenriched_ips.add(ip)
+    headers_a = ["ASN", "AS Name", "ISP", "Countries", "Messages", "Likely Scam",
+                 "Distinct IPs", "Distinct Sender Domains", "Sample Subjects"]
+    for col, name in enumerate(headers_a, start=1):
+        c = ws_asn.cell(row=1, column=col, value=name)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    r_idx = 2
+    for asn, entries in sorted(asn_map.items(), key=lambda x: -len(x[1])):
+        items = [r for r, _ in entries]
+        ips = sorted(set(ip for _, ip in entries))
+        enr0 = ip_enrichment.get(ips[0], {})
+        countries = sorted(set(
+            ip_enrichment.get(ip, {}).get("country_code", "") for ip in ips
+        ) - {""})
+        doms = sorted(set(it["from_domain"] for it in items if it["from_domain"]))
+        n_scam = sum(1 for it in items if it["category"] == "likely_scam")
+        subs = " | ".join(it["subject"][:60] for it in items[:4])
+        values_a = [asn, enr0.get("as_name", ""), enr0.get("isp", ""),
+                    ", ".join(countries), len(items), n_scam, len(ips), len(doms), subs]
+        for col, val in enumerate(values_a, start=1):
+            c = ws_asn.cell(row=r_idx, column=col, value=val)
+            c.font = CELL_FONT
+            if col == 9:
+                c.alignment = WRAP
+        r_idx += 1
+    ws_asn.freeze_panes = "A2"
+    if r_idx > 2:
+        ws_asn.auto_filter.ref = f"A1:I{r_idx-1}"
+    for col_letter, w_ in zip("ABCDEFGHI", (10, 24, 24, 12, 11, 11, 12, 20, 60)):
+        ws_asn.column_dimensions[col_letter].width = w_
+    if unenriched_ips:
+        c = ws_asn.cell(row=r_idx + 1, column=1,
+                        value=f"{len(unenriched_ips)} origin IP(s) not yet enriched -- "
+                              "run lookup_ips.py and rebuild.")
+        c.font = Font(name=FONT, italic=True, size=10, color="666666")
 
     # ---- Template Clusters (messages sharing a body template) ----
     # Groups messages whose bodies are near-duplicates once the parts that
@@ -479,6 +631,13 @@ def main():
     ws8.column_dimensions["F"].width = 40
 
     # ---- Wallets (crypto addresses found in message bodies) ----
+    # Enriched with on-chain activity from lookup_wallets.py when available.
+    # A wallet that has actually received funds means the campaign has
+    # victims -- highlighted red, and the single most report-worthy thing in
+    # this workbook (file it with IC3 / chainabuse.com).
+    ACTIVE_FILL = PatternFill("solid", fgColor="FFC7CE")
+    ACTIVE_FONT = Font(name=FONT, size=10, bold=True, color="9C0006")
+    wallet_enrichment = load_wallet_enrichment()
     ws_wallets = wb.create_sheet("Wallets")
     wallet_map = defaultdict(list)
     for r in rows:
@@ -491,34 +650,57 @@ def main():
             if w:
                 wallet_map[("ETH", w)].append(r)
     headers_w = ["Type", "Address", "Times Seen", "Distinct Sender Domains",
-                 "Sample Subjects", "Sample Message IDs"]
+                 "On-Chain Txs", "Total Received", "Balance", "First Seen",
+                 "Last Seen", "Checked", "Sample Subjects", "Sample Message IDs"]
     for col, name in enumerate(headers_w, start=1):
         c = ws_wallets.cell(row=1, column=col, value=name)
         c.font = HEADER_FONT
         c.fill = HEADER_FILL
+
+    def wallet_sort_key(item):
+        (kind, w), items = item
+        enr = wallet_enrichment.get(w, {})
+        try:
+            txs = int(enr.get("tx_count") or 0)
+        except ValueError:
+            txs = 0
+        return (0 if txs else 1, -txs, -len(items))  # active on-chain first
+
     r_idx = 2
-    for (kind, w), items in sorted(wallet_map.items(), key=lambda x: -len(x[1])):
+    for (kind, w), items in sorted(wallet_map.items(), key=wallet_sort_key):
         doms = sorted(set(it["from_domain"] for it in items if it["from_domain"]))
         subs = " | ".join(it["subject"][:60] for it in items[:4])
         ids = ", ".join(it["id"] for it in items[:6])
+        enr = wallet_enrichment.get(w, {})
+        try:
+            txs = int(enr.get("tx_count") or 0)
+        except ValueError:
+            txs = 0
+        is_active = txs > 0
         ws_wallets.cell(row=r_idx, column=1, value=kind).font = CELL_FONT
-        ws_wallets.cell(row=r_idx, column=2, value=w).font = CELL_FONT
+        c_addr = ws_wallets.cell(row=r_idx, column=2, value=w)
+        c_addr.font = ACTIVE_FONT if is_active else CELL_FONT
+        if is_active:
+            c_addr.fill = ACTIVE_FILL
         ws_wallets.cell(row=r_idx, column=3, value=len(items)).font = CELL_FONT
         ws_wallets.cell(row=r_idx, column=4, value=len(doms)).font = CELL_FONT
-        c_subs = ws_wallets.cell(row=r_idx, column=5, value=subs)
+        enr_values = [enr.get("tx_count", "") if enr else "",
+                      enr.get("total_received", ""), enr.get("balance", ""),
+                      enr.get("first_seen", ""), enr.get("last_seen", ""),
+                      enr.get("checked_date", "")]
+        for offset, val in enumerate(enr_values):
+            c_enr = ws_wallets.cell(row=r_idx, column=5 + offset, value=val)
+            c_enr.font = ACTIVE_FONT if is_active else CELL_FONT
+        c_subs = ws_wallets.cell(row=r_idx, column=11, value=subs)
         c_subs.font = CELL_FONT
         c_subs.alignment = WRAP
-        ws_wallets.cell(row=r_idx, column=6, value=ids).font = CELL_FONT
+        ws_wallets.cell(row=r_idx, column=12, value=ids).font = CELL_FONT
         r_idx += 1
     ws_wallets.freeze_panes = "A2"
     if r_idx > 2:
-        ws_wallets.auto_filter.ref = f"A1:F{r_idx-1}"
-    ws_wallets.column_dimensions["A"].width = 8
-    ws_wallets.column_dimensions["B"].width = 42
-    ws_wallets.column_dimensions["C"].width = 12
-    ws_wallets.column_dimensions["D"].width = 20
-    ws_wallets.column_dimensions["E"].width = 60
-    ws_wallets.column_dimensions["F"].width = 40
+        ws_wallets.auto_filter.ref = f"A1:L{r_idx-1}"
+    for col_letter, w_ in zip("ABCDEFGHIJKL", (8, 42, 12, 12, 12, 18, 16, 13, 13, 12, 50, 40)):
+        ws_wallets.column_dimensions[col_letter].width = w_
 
     # ---- Images (attachment/inline image hashes) ----
     # Keyed by byte hash (sha256, truncated); a perceptual hash column links
