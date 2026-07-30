@@ -2,12 +2,37 @@
 Shared IOC extraction + triage logic, used by process_mail.py.
 """
 
+import csv
+import io
 import os
 import re
 import email.utils
 import hashlib
+import unicodedata
+from datetime import date, timezone
 from email.header import decode_header
+from html.parser import HTMLParser
 from urllib.parse import urlparse
+
+# Optional image-analysis dependencies. Everything degrades gracefully:
+# without Pillow/imagehash there's no perceptual hashing, without
+# pytesseract (plus the Tesseract binary) there's no OCR -- but byte-level
+# image hashing and everything else still works.
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+try:
+    import imagehash
+    HAS_IMAGEHASH = HAS_PIL
+except ImportError:
+    HAS_IMAGEHASH = False
+try:
+    import pytesseract
+    HAS_TESSERACT = HAS_PIL
+except ImportError:
+    HAS_TESSERACT = False
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 
@@ -86,6 +111,25 @@ KNOWN_LEGIT_DOMAINS = {
     "fastly.com", "podio.com",
 }
 
+# --- Flexible keyword matching ------------------------------------------
+# Keyword phrases used to be matched as exact substrings, which missed
+# variants like "verify your Amazon account" (extra word) or punctuation
+# differences. Instead, each phrase is compiled to a regex that tokenizes
+# on non-alphanumerics and allows a small gap of extra words between
+# tokens: "verify your account" also matches "verify your Amazon account".
+def _phrase_regex(phrase, max_gap_words=2):
+    tokens = re.findall(r'[a-z0-9]+', phrase.lower())
+    if not tokens:
+        return None
+    gap = r'(?:\W+\w+){0,%d}?\W+' % max_gap_words
+    return r'\b' + gap.join(re.escape(t) for t in tokens) + r'\b'
+
+
+def _compile_phrases(phrases, max_gap_words=2):
+    parts = [p for p in (_phrase_regex(kw, max_gap_words) for kw in phrases) if p]
+    return re.compile("|".join(parts), re.IGNORECASE)
+
+
 URGENT_KEYWORDS = [
     # English
     "act now", "urgent", "verify your account", "suspended", "final notice",
@@ -119,6 +163,8 @@ URGENT_KEYWORDS = [
     "accion requerida", "última oportunidad", "ultima oportunidad",
 ]
 
+URGENT_RE = _compile_phrases(URGENT_KEYWORDS)
+
 # Brands/institutions commonly impersonated in the sample data. This is a
 # subcategory on top of triage's likely_scam/review/bulk_marketing -- e.g.
 # "likely_scam, impersonating Aflac and AARP". Keyword-based like the lists
@@ -148,15 +194,61 @@ IMPERSONATED_BRANDS = {
     "Chase": ["chase bank", "jpmorgan chase"],
 }
 
+# Official root domains per brand, used by the display-name-mismatch signal:
+# a From name of "PayPal" sent from anything but paypal.com is one of the
+# most reliable phishing markers there is, and needs no keyword in the body.
+BRAND_LEGIT_DOMAINS = {
+    "Aflac": {"aflac.com"},
+    "AARP": {"aarp.org"},
+    "Medicare": {"medicare.gov", "cms.gov"},
+    "Social Security Administration": {"ssa.gov"},
+    "IRS": {"irs.gov"},
+    "USPS": {"usps.com", "usps.gov"},
+    "FedEx": {"fedex.com"},
+    "UPS": {"ups.com"},
+    "Amazon": {"amazon.com"},
+    "Netflix": {"netflix.com"},
+    "PayPal": {"paypal.com"},
+    "Apple": {"apple.com", "icloud.com"},
+    "Microsoft": {"microsoft.com", "outlook.com", "live.com"},
+    "Norton": {"norton.com", "nortonlifelock.com", "gendigital.com"},
+    "McAfee": {"mcafee.com"},
+    "Geek Squad": {"bestbuy.com", "geeksquad.com"},
+    "DocuSign": {"docusign.com", "docusign.net"},
+    "Coinbase": {"coinbase.com"},
+    "Bank of America": {"bankofamerica.com", "bofa.com"},
+    "Wells Fargo": {"wellsfargo.com"},
+    "Chase": {"chase.com", "jpmorganchase.com", "jpmchase.com"},
+}
 
-def detect_brands(subject, body):
+# Brand names that are common English words / too short to match against a
+# display name bare (e.g. "UPS" would hit "SIGN UPS"). For display-name
+# matching these use the full keyword regexes instead of the brand name.
+_BRAND_NAME_RES = {
+    brand: _compile_phrases([brand] if len(brand) > 3 else keywords, max_gap_words=0)
+    for brand, keywords in IMPERSONATED_BRANDS.items()
+}
+_BRAND_KEYWORD_RES = {
+    brand: _compile_phrases(keywords) for brand, keywords in IMPERSONATED_BRANDS.items()
+}
+
+
+def detect_brands(subject, body, from_name=""):
     """Return the sorted list of brands/institutions this email appears to
-    be impersonating, based on keyword hits in the subject+body."""
-    text = f" {subject}\n{body} ".lower()
+    be impersonating, based on keyword hits in the display name, subject,
+    and body."""
+    text = f" {from_name}\n{subject}\n{body} "
     return sorted(
-        brand for brand, keywords in IMPERSONATED_BRANDS.items()
-        if any(k in text for k in keywords)
+        brand for brand, kw_re in _BRAND_KEYWORD_RES.items()
+        if kw_re.search(text)
     )
+
+
+def brands_in_display_name(from_name):
+    """Brands whose name appears in the From display name itself."""
+    if not from_name:
+        return []
+    return sorted(b for b, name_re in _BRAND_NAME_RES.items() if name_re.search(from_name))
 
 
 # --- Deobfuscating hidden contact info ---------------------------------
@@ -188,7 +280,10 @@ OBFUSCATED_EMAIL_RE = re.compile(
 
 def deobfuscate(text):
     """Undo the cheap obfuscation tricks described above so downstream
-    extraction sees plain @ addresses."""
+    extraction sees plain @ addresses. NFKC normalization additionally
+    folds fullwidth/stylized Unicode letters (ｕｒｇｅｎｔ, 𝐮𝐫𝐠𝐞𝐧𝐭, etc.)
+    back to plain ASCII -- a much wider net than the homoglyph map alone."""
+    text = unicodedata.normalize("NFKC", text)
     text = ZERO_WIDTH_RE.sub('', text)
     text = text.translate(HOMOGLYPH_MAP)
     text = OBFUSCATED_EMAIL_RE.sub(lambda m: f"{m.group(1)}@{m.group(2)}.{m.group(3)}", text)
@@ -250,7 +345,107 @@ def decode_mime_header(value):
         return str(value)
 
 
+# --- HTML body parsing ---------------------------------------------------
+# HTML used to be flattened with a bare tag-stripping regex, which (a) never
+# decoded entities, so "Verif&#121; your account" dodged every keyword,
+# (b) threw away <a href=...> URLs entirely -- HTML-only spam contributed no
+# URLs unless one appeared in visible text, (c) kept display:none word-salad
+# blocks that poison keyword matching and the SimHash, and (d) lost the
+# anchor-text-vs-href mismatch evidence (<a href="evil.top">paypal.com</a>),
+# a top-tier phishing signal. This parser fixes all four. html.parser
+# decodes entities for free (convert_charrefs=True by default).
+_HIDDEN_STYLE_RE = re.compile(
+    r'display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0(?:px|pt|em|rem|;|\s|$)|'
+    r'opacity\s*:\s*0(?:\.0+)?\s*(?:;|$)', re.I)
+_DOMAINISH_RE = re.compile(r'\b((?:[a-z0-9-]+\.)+[a-z]{2,})\b', re.I)
+_VOID_TAGS = {"br", "img", "hr", "input", "meta", "link", "area", "base", "col",
+              "embed", "source", "track", "wbr"}
+
+
+class _HTMLBodyParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.chunks = []           # visible text
+        self.img_srcs = []         # every <img src=...>
+        self.hrefs = []            # every <a href=...>
+        self.link_mismatches = []  # "shown-domain => real-href-domain"
+        self._skip_stack = []      # open script/style/hidden elements
+        self._anchor_href = None
+        self._anchor_text = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in _VOID_TAGS:
+            if tag == "img":
+                src = dict(attrs).get("src") or ""
+                if src:
+                    self.img_srcs.append(src.strip())
+            elif tag == "br":
+                self.chunks.append("\n")
+            return
+        style = dict(attrs).get("style") or ""
+        if tag in ("script", "style") or _HIDDEN_STYLE_RE.search(style):
+            self._skip_stack.append(tag)
+            return
+        if tag == "a":
+            href = (dict(attrs).get("href") or "").strip()
+            if href and not href.lower().startswith(("mailto:", "javascript:", "tel:")):
+                self.hrefs.append(href)
+            self._anchor_href = href
+            self._anchor_text = []
+        elif tag in ("p", "div", "tr", "li", "table", "h1", "h2", "h3", "h4"):
+            self.chunks.append("\n")
+
+    def handle_endtag(self, tag):
+        if self._skip_stack and self._skip_stack[-1] == tag:
+            self._skip_stack.pop()
+            return
+        if tag == "a" and self._anchor_href is not None:
+            self._check_anchor_mismatch()
+            self._anchor_href = None
+            self._anchor_text = []
+
+    def _check_anchor_mismatch(self):
+        """Flag anchors whose *visible* text looks like a URL/domain that
+        doesn't match where the href actually points."""
+        text = " ".join(self._anchor_text).strip()
+        href_domain = domain_of(self._anchor_href)
+        if not text or not href_domain:
+            return
+        m = _DOMAINISH_RE.search(text)
+        if not m:
+            return
+        shown = m.group(1).lower()
+        shown_root = ".".join(shown.split(".")[-2:])
+        href_root = ".".join(href_domain.split(":")[0].split(".")[-2:])
+        if shown_root != href_root:
+            self.link_mismatches.append(f"{shown} => {href_domain}")
+
+    def handle_data(self, data):
+        if self._skip_stack:
+            return
+        if self._anchor_href is not None:
+            self._anchor_text.append(data)
+        self.chunks.append(data)
+
+
+def html_to_evidence(html_text):
+    """Parse an HTML body into (visible_text, hrefs, img_srcs, mismatches)."""
+    parser = _HTMLBodyParser()
+    try:
+        parser.feed(html_text)
+        parser.close()
+    except Exception:
+        # malformed HTML: fall back to the old tag-stripping behavior
+        import html as html_mod
+        return html_mod.unescape(re.sub(r"<[^>]+>", " ", html_text)), [], [], []
+    return ("".join(parser.chunks), parser.hrefs, parser.img_srcs,
+            parser.link_mismatches)
+
+
 def get_body_text(msg):
+    """Return (text, hrefs, img_srcs, link_mismatches) for a message: plain
+    text plus the flattened visible text of any HTML parts, and the link/
+    image evidence recovered from the HTML."""
     text_parts, html_parts = [], []
     if msg.is_multipart():
         for part in msg.walk():
@@ -286,9 +481,14 @@ def get_body_text(msg):
             text_parts.append(decoded)
 
     combined = "\n".join(text_parts)
-    if html_parts:
-        combined += "\n" + re.sub(r"<[^>]+>", " ", "\n".join(html_parts))
-    return combined
+    hrefs, img_srcs, mismatches = [], [], []
+    for html_text in html_parts:
+        text, h, srcs, mm = html_to_evidence(html_text)
+        combined += "\n" + text
+        hrefs += h
+        img_srcs += srcs
+        mismatches += mm
+    return combined, hrefs, img_srcs, mismatches
 
 
 def extract_ips(received_headers):
@@ -310,33 +510,179 @@ def domain_of(url):
 
 
 def parse_auth_results(auth_header):
+    """Capture the full result token, not just pass/fail -- softfail, none,
+    neutral, permerror, temperror all carry signal (or its absence)."""
     if not auth_header:
         return "", "", ""
-    dkim = "pass" if re.search(r'dkim=pass', auth_header) else ("fail" if re.search(r'dkim=fail', auth_header) else "")
-    spf = "pass" if re.search(r'spf=pass', auth_header) else ("fail" if re.search(r'spf=fail', auth_header) else "")
-    dmarc = "pass" if re.search(r'dmarc=pass', auth_header) else ("fail" if re.search(r'dmarc=fail', auth_header) else "")
-    return dkim, spf, dmarc
+
+    def result_of(mech):
+        m = re.search(mech + r'=(\w+)', auth_header, re.I)
+        return m.group(1).lower() if m else ""
+
+    return result_of("dkim"), result_of("spf"), result_of("dmarc")
 
 
 def msg_id_hash(msg):
-    mid = msg.get("Message-ID", "") or ""
-    return hashlib.sha1(str(mid).encode("utf-8", errors="replace")).hexdigest()[:10]
+    """Dedup id. Messages with no Message-ID (not rare in spam) fall back to
+    hashing Date+From+Subject -- previously they all hashed to the same id,
+    so every Message-ID-less email after the first was silently dropped as
+    a 'duplicate'."""
+    mid = (msg.get("Message-ID", "") or "").strip()
+    if not mid:
+        mid = "\x00".join(str(msg.get(h, "") or "") for h in ("Date", "From", "Subject"))
+    return hashlib.sha1(mid.encode("utf-8", errors="replace")).hexdigest()[:10]
 
 
-def triage(from_domain, has_list_unsubscribe, subject, body):
-    """Very cheap rule-based triage -- no LLM/API calls, so it costs nothing to run."""
-    text = f"{subject}\n{body}".lower()
+# Freemail providers: a Reply-To at one of these while From claims some
+# other domain is a classic advance-fee/BEC pattern (the From is spoofed
+# or a burner; the freemail inbox is the part the scammer actually reads).
+FREEMAIL_DOMAINS = {
+    "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
+    "msn.com", "yahoo.com", "ymail.com", "aol.com", "proton.me",
+    "protonmail.com", "icloud.com", "me.com", "mail.com", "gmx.com",
+    "gmx.net", "yandex.com", "yandex.ru", "zoho.com", "mail.ru",
+}
+
+# Common URL shorteners/redirectors -- these hide the real destination, so
+# their presence in spam is worth flagging (and the shortened link is what
+# you'd report to the shortener's abuse desk).
+SHORTENER_DOMAINS = {
+    "bit.ly", "tinyurl.com", "t.co", "goo.gl", "is.gd", "cutt.ly", "rb.gy",
+    "rebrand.ly", "ow.ly", "buff.ly", "shorturl.at", "t.ly", "s.id",
+    "tiny.cc", "lnkd.in", "qrco.de",
+}
+
+# WHOIS enrichment (data/domain_enrichment.csv, built by lookup_domains.py)
+# doubles as a triage signal: a sender domain registered days/weeks ago is
+# near-conclusive on its own. Loaded once at import, keyed by domain.
+ENRICHMENT_PATH = os.path.join(BASE, "data", "domain_enrichment.csv")
+_DATE_IN_STRING_RE = re.compile(r'(\d{4})-(\d{2})-(\d{2})')
+
+
+def _load_domain_ages():
+    ages = {}
+    if not os.path.exists(ENRICHMENT_PATH):
+        return ages
+    try:
+        with open(ENRICHMENT_PATH, encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                m = _DATE_IN_STRING_RE.search(r.get("registered_date") or "")
+                if m:
+                    try:
+                        reg = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                        ages[(r.get("domain") or "").lower()] = (date.today() - reg).days
+                    except ValueError:
+                        pass
+    except Exception:
+        pass
+    return ages
+
+
+DOMAIN_AGE_DAYS = _load_domain_ages()
+
+
+def url_flags(urls):
+    """Suspicious-URL markers: punycode (IDN homoglyph) domains and known
+    URL shorteners."""
+    flags = []
+    for u in urls:
+        dom = domain_of(u)
+        root = ".".join(dom.split(".")[-2:]) if dom else ""
+        if "xn--" in dom:
+            flags.append(f"punycode:{dom}")
+        if root in SHORTENER_DOMAINS or dom in SHORTENER_DOMAINS:
+            flags.append(f"shortener:{dom}")
+    return sorted(set(flags))
+
+
+def triage(signals):
+    """Weighted rule-based triage -- still no LLM/API calls. Takes a dict of
+    extracted signals, returns (category, score, reasons). Each reason is a
+    human-readable 'why', kept in the CSV so scores can be audited/tuned.
+
+    Rough calibration: one strong signal (urgent keywords, brand display-name
+    mismatch, brand-new domain) is enough for likely_scam on its own;
+    weaker signals (auth failures, freemail reply-to, shorteners) need to
+    stack up. A List-Unsubscribe header no longer vetoes anything -- scams
+    add fake ones -- it only classifies otherwise-signal-free mail as
+    bulk_marketing."""
+    score = 0
+    reasons = []
+
+    from_domain = signals.get("from_domain", "")
     root_domain = ".".join(from_domain.split(".")[-2:]) if from_domain else ""
-
     if root_domain in KNOWN_LEGIT_DOMAINS or from_domain in KNOWN_LEGIT_DOMAINS:
-        return "bulk_marketing"
-    if has_list_unsubscribe and not any(k in text for k in URGENT_KEYWORDS):
-        return "bulk_marketing"
-    if any(k in text for k in URGENT_KEYWORDS):
-        return "likely_scam"
+        return "bulk_marketing", 0, ["known legit domain"]
+
+    m = URGENT_RE.search(signals.get("text", ""))
+    if m:
+        score += 3
+        reasons.append(f"urgent keyword: {m.group(0)[:40]!r}")
+
+    # Brand in the From display name but sent from a non-official domain
+    for brand in signals.get("display_name_brands", []):
+        legit = BRAND_LEGIT_DOMAINS.get(brand, set())
+        if root_domain and root_domain not in legit and from_domain not in legit:
+            score += 3
+            reasons.append(f"display name claims {brand}, sent from {from_domain}")
+            break
+
+    reply_domain = signals.get("reply_to_domain", "")
+    reply_root = ".".join(reply_domain.split(".")[-2:]) if reply_domain else ""
+    if reply_root and root_domain and reply_root != root_domain:
+        if reply_root in FREEMAIL_DOMAINS:
+            score += 2
+            reasons.append(f"reply-to diverted to freemail ({reply_domain})")
+        else:
+            score += 1
+            reasons.append(f"reply-to domain ({reply_domain}) != from domain")
+
+    dkim, spf, dmarc = signals.get("dkim", ""), signals.get("spf", ""), signals.get("dmarc", "")
+    if dmarc == "fail":
+        score += 2
+        reasons.append("dmarc=fail")
+    if spf in ("fail", "softfail"):
+        score += 1
+        reasons.append(f"spf={spf}")
+    if dkim == "fail":
+        score += 1
+        reasons.append("dkim=fail")
+
+    age = DOMAIN_AGE_DAYS.get(from_domain) or DOMAIN_AGE_DAYS.get(root_domain)
+    if age is not None:
+        if age < 90:
+            score += 3
+            reasons.append(f"sender domain registered {age} days ago")
+        elif age < 365:
+            score += 1
+            reasons.append(f"sender domain registered {age} days ago")
+
     if from_domain.endswith(".edu") or ".edu." in from_domain or ".ac." in from_domain:
-        return "likely_scam"  # academic domains sending unsolicited mail are usually compromised
-    return "review"
+        score += 2
+        reasons.append("unsolicited mail from academic domain (often compromised)")
+
+    n_mismatch = len(signals.get("link_mismatches", []))
+    if n_mismatch:
+        score += 2
+        reasons.append(f"{n_mismatch} link(s) whose visible text hides the real destination")
+
+    if signals.get("has_wallet"):
+        score += 1
+        reasons.append("crypto wallet address in body")
+
+    flags = signals.get("url_flags", [])
+    if any(f.startswith("punycode:") for f in flags):
+        score += 2
+        reasons.append("punycode (IDN look-alike) domain in URL")
+    elif flags:
+        score += 1
+        reasons.append("URL shortener hides destination")
+
+    if score >= 3:
+        return "likely_scam", score, reasons
+    if score == 0 and signals.get("has_list_unsubscribe"):
+        return "bulk_marketing", score, reasons
+    return "review", score, reasons
 
 
 # --- Functional vs. filler classification -----------------------------
@@ -421,6 +767,80 @@ def classify_phones(body, candidate_phones):
     return sorted(functional), sorted(filler)
 
 
+# --- Image analysis ------------------------------------------------------
+# Three tiers, all local, each optional beyond the first:
+# 1. sha256 of the raw bytes -- image reuse across campaigns is an operator
+#    fingerprint all by itself, no image decoding needed.
+# 2. Perceptual hash (Pillow + imagehash) -- survives recompression/resizing,
+#    so near-identical images cluster like SimHash does for text.
+# 3. OCR (pytesseract + the Tesseract binary) -- recovers text from
+#    image-only spam, which then flows through the existing deobfuscate/
+#    keyword/extraction pipeline like any other body text.
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff")
+OCR_MIN_DIMENSION = 60      # skip tracking pixels / tiny decorations
+OCR_MAX_BYTES = 5_000_000   # don't decode absurdly large payloads
+
+
+def extract_images(msg):
+    """Return (image_records, ocr_text) for every inline/attached image.
+    Each record: {sha256 (truncated), phash, filename, content_type, size}."""
+    records = []
+    ocr_chunks = []
+    for part in msg.walk():
+        fname = part.get_filename() or ""
+        is_image = (part.get_content_maintype() == "image"
+                    or fname.lower().endswith(IMAGE_EXTS))
+        if not is_image:
+            continue
+        try:
+            payload = part.get_payload(decode=True)
+        except Exception:
+            payload = None
+        if not payload:
+            continue
+        rec = {
+            "sha256": hashlib.sha256(payload).hexdigest()[:16],
+            "phash": "",
+            "filename": decode_mime_header(fname),
+            "content_type": part.get_content_type(),
+            "size": len(payload),
+        }
+        if HAS_PIL and len(payload) <= OCR_MAX_BYTES:
+            try:
+                img = Image.open(io.BytesIO(payload))
+                img.load()
+                if HAS_IMAGEHASH:
+                    try:
+                        rec["phash"] = str(imagehash.phash(img))
+                    except Exception:
+                        pass
+                if HAS_TESSERACT and min(img.size) >= OCR_MIN_DIMENSION:
+                    try:
+                        text = pytesseract.image_to_string(img)
+                        if text.strip():
+                            ocr_chunks.append(text)
+                    except Exception:
+                        pass  # e.g. tesseract binary not installed
+            except Exception:
+                pass  # not decodable as an image; keep the byte hash anyway
+        records.append(rec)
+    return records, "\n".join(ocr_chunks)
+
+
+def normalize_date(date_hdr):
+    """Header date -> ISO 'YYYY-MM-DD' (UTC), or '' if unparseable. Gives
+    the report a real time axis for trend analysis."""
+    if not date_hdr:
+        return ""
+    try:
+        dt = email.utils.parsedate_to_datetime(date_hdr)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc)
+        return dt.date().isoformat()
+    except Exception:
+        return ""
+
+
 def extract_row(msg, source="imap"):
     """Extract one IOC row (dict) from an email.message.Message."""
     subject = decode_mime_header(msg.get("Subject"))
@@ -430,9 +850,11 @@ def extract_row(msg, source="imap"):
 
     reply_to_hdr = msg.get("Reply-To")
     reply_to_name, reply_to_addr = email.utils.parseaddr(reply_to_hdr or "")
+    reply_to_domain = reply_to_addr.split("@")[-1].lower() if "@" in reply_to_addr else ""
 
     return_path = (msg.get("Return-Path", "") or "").strip("<>")
     date_hdr = msg.get("Date", "")
+    date_iso = normalize_date(date_hdr)
 
     auth_results = msg.get("Authentication-Results", "")
     dkim, spf, dmarc = parse_auth_results(auth_results)
@@ -442,10 +864,22 @@ def extract_row(msg, source="imap"):
 
     has_list_unsubscribe = bool(msg.get("List-Unsubscribe"))
 
-    body = deobfuscate(get_body_text(msg))
+    raw_body, hrefs, img_srcs, link_mismatches = get_body_text(msg)
+    images, ocr_text = extract_images(msg)
+    # OCR text joins the body for extraction/keywords -- image-only spam
+    # finally contributes URLs, contacts, and keyword hits.
+    if ocr_text:
+        raw_body += "\n" + ocr_text
+    body = deobfuscate(raw_body)
 
-    urls = list(dict.fromkeys(URL_RE.findall(body)))
+    # <a href> targets recovered from the HTML count as URLs too -- the old
+    # tag-stripping approach deleted them along with the markup.
+    urls = list(dict.fromkeys(hrefs + URL_RE.findall(body)))
     url_domains = sorted(set(domain_of(u) for u in urls if domain_of(u)))
+    remote_image_domains = sorted(set(
+        d for d in (domain_of(s) for s in img_srcs if s.lower().startswith("http"))
+        if d
+    ))
 
     phones = extract_phones(body)
     btc = list(dict.fromkeys(BTC_RE.findall(body)))
@@ -466,15 +900,30 @@ def extract_row(msg, source="imap"):
     functional_contacts, filler_contacts = classify_contacts(body, contact_emails)
     functional_phones, filler_phones = classify_phones(body, phones)
 
-    category = triage(from_domain, has_list_unsubscribe, subject, body)
-    impersonated_brands = detect_brands(subject, body)
+    flags = url_flags(urls)
+    display_name_brands = brands_in_display_name(from_name)
+    category, scam_score, scam_reasons = triage({
+        "from_domain": from_domain,
+        "reply_to_domain": reply_to_domain,
+        "text": f"{subject}\n{body}",
+        "display_name_brands": display_name_brands,
+        "dkim": dkim, "spf": spf, "dmarc": dmarc,
+        "link_mismatches": link_mismatches,
+        "has_wallet": bool(btc or eth),
+        "url_flags": flags,
+        "has_list_unsubscribe": has_list_unsubscribe,
+    })
+    impersonated_brands = detect_brands(subject, body, from_name)
     template_fingerprint = body_template_fingerprint(body)
 
     return {
         "id": msg_id_hash(msg),
         "source": source,
         "category": category,
+        "scam_score": scam_score,
+        "scam_signals": "; ".join(scam_reasons),
         "date": date_hdr,
+        "date_iso": date_iso,
         "subject": subject,
         "from_name": from_name,
         "from_addr": from_addr,
@@ -499,4 +948,12 @@ def extract_row(msg, source="imap"):
         "first_url": urls[0] if urls else "",
         "impersonated_brands": "; ".join(impersonated_brands),
         "body_template_fingerprint": template_fingerprint,
+        "link_mismatches": "; ".join(link_mismatches),
+        "url_flags": "; ".join(flags),
+        "remote_image_domains": "; ".join(remote_image_domains),
+        "image_count": len(images),
+        "image_hashes": "; ".join(r["sha256"] for r in images),
+        "image_phashes": "; ".join(r["phash"] for r in images if r["phash"]),
+        "image_filenames": "; ".join(r["filename"] for r in images if r["filename"]),
+        "image_ocr_chars": len(ocr_text),
     }, urls

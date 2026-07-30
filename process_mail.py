@@ -35,16 +35,49 @@ MASTER_URLS_CSV = os.path.join(BASE, "data", "master_urls.csv")
 DATE_DIR_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 
 FIELDNAMES = [
-    "id", "source", "category", "date", "subject", "from_name", "from_addr",
+    "id", "source", "category", "scam_score", "scam_signals", "date",
+    "date_iso", "subject", "from_name", "from_addr",
     "from_domain", "return_path", "reply_to_addr", "list_unsubscribe",
     "dkim", "spf", "dmarc", "originating_ips", "url_count", "url_domains",
     "phone_numbers", "btc_addresses", "eth_addresses",
     "contact_emails_in_body", "contacts_functional", "contacts_filler",
     "phones_functional", "phones_filler", "first_url",
     "impersonated_brands", "body_template_fingerprint",
+    "link_mismatches", "url_flags", "remote_image_domains",
+    "image_count", "image_hashes", "image_phashes", "image_filenames",
+    "image_ocr_chars",
 ]
 
 DEFAULT_SOURCE = "input"
+
+
+def migrate_schema():
+    """If master_iocs.csv predates a column addition, rewrite it once with
+    the current FIELDNAMES (new columns blank for old rows). Rows ingested
+    before a feature existed simply have no data for it."""
+    if not os.path.exists(MASTER_CSV):
+        return
+    with open(MASTER_CSV, encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames == FIELDNAMES:
+            return
+        old_rows = list(reader)
+        old_fields = reader.fieldnames or []
+    dropped = [c for c in old_fields if c not in FIELDNAMES]
+    if dropped:
+        raise SystemExit(
+            f"{MASTER_CSV} has columns not in the current schema ({dropped}); "
+            "refusing to migrate automatically."
+        )
+    tmp = MASTER_CSV + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer.writeheader()
+        for r in old_rows:
+            writer.writerow({k: r.get(k, "") for k in FIELDNAMES})
+    os.replace(tmp, MASTER_CSV)
+    print(f"Migrated {MASTER_CSV} to the current schema "
+          f"({len(old_fields)} -> {len(FIELDNAMES)} columns, {len(old_rows)} rows kept).")
 
 
 def load_existing_ids():
@@ -155,6 +188,7 @@ def append_rows(rows, url_rows):
 def main():
     os.makedirs(INPUT_DIR, exist_ok=True)
     os.makedirs(SCANNED_DIR, exist_ok=True)
+    migrate_schema()
 
     files = []
     for root, _dirs, names in os.walk(INPUT_DIR):

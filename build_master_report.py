@@ -4,6 +4,7 @@ Safe to run repeatedly -- it's a full rebuild from the CSV, not an append,
 so the CSV is always the source of truth."""
 
 import csv
+import email.utils
 import os
 from collections import Counter, defaultdict
 from openpyxl import Workbook
@@ -15,6 +16,20 @@ MASTER_CSV = os.path.join(BASE, "data", "master_iocs.csv")
 MASTER_URLS_CSV = os.path.join(BASE, "data", "master_urls.csv")
 ENRICHMENT_CSV = os.path.join(BASE, "data", "domain_enrichment.csv")
 OUT_XLSX = os.path.join(BASE, "output", "master_report.xlsx")
+
+
+def month_of(row):
+    """'YYYY-MM' for a row, preferring the normalized date_iso column and
+    falling back to parsing the raw Date header (for rows ingested before
+    date_iso existed)."""
+    d = (row.get("date_iso") or "").strip()
+    if len(d) >= 7:
+        return d[:7]
+    try:
+        dt = email.utils.parsedate_to_datetime(row.get("date", ""))
+        return dt.strftime("%Y-%m") if dt else ""
+    except Exception:
+        return ""
 
 
 def load_enrichment():
@@ -166,7 +181,11 @@ def main():
               "originating_ips": 24, "url_count": 10, "url_domains": 26, "phone_numbers": 20,
               "btc_addresses": 20, "eth_addresses": 20, "contact_emails_in_body": 30,
               "first_url": 30, "id": 12, "source": 14, "category": 16, "list_unsubscribe": 14,
-              "impersonated_brands": 24, "body_template_fingerprint": 18}
+              "impersonated_brands": 24, "body_template_fingerprint": 18,
+              "scam_score": 10, "scam_signals": 50, "date_iso": 12,
+              "link_mismatches": 32, "url_flags": 24, "remote_image_domains": 26,
+              "image_count": 10, "image_hashes": 24, "image_phashes": 24,
+              "image_filenames": 24, "image_ocr_chars": 10}
     for col, name in enumerate(fieldnames, start=1):
         ws2.column_dimensions[get_column_letter(col)].width = widths.get(name, 16)
 
@@ -501,6 +520,54 @@ def main():
     ws_wallets.column_dimensions["E"].width = 60
     ws_wallets.column_dimensions["F"].width = 40
 
+    # ---- Images (attachment/inline image hashes) ----
+    # Keyed by byte hash (sha256, truncated); a perceptual hash column links
+    # recompressed/resized variants of the same artwork when imagehash was
+    # installed at ingest time. A repeated image across sender domains is an
+    # operator fingerprint just like a reused phone number.
+    ws_img = wb.create_sheet("Images")
+    image_map = defaultdict(list)   # sha -> [row, ...]
+    image_phash = {}                # sha -> phash (first seen)
+    image_names = defaultdict(set)  # sha -> filenames
+    for r in rows:
+        hashes = [h.strip() for h in (r.get("image_hashes") or "").split(";") if h.strip()]
+        phashes = [p.strip() for p in (r.get("image_phashes") or "").split(";") if p.strip()]
+        names = [n.strip() for n in (r.get("image_filenames") or "").split(";") if n.strip()]
+        for i, h in enumerate(hashes):
+            image_map[h].append(r)
+            if i < len(phashes) and h not in image_phash:
+                image_phash[h] = phashes[i]
+            if i < len(names):
+                image_names[h].add(names[i])
+    headers_i = ["Image Hash (sha256)", "Perceptual Hash", "Times Seen",
+                 "Distinct Sender Domains", "Filenames", "Sample Subjects", "Sample Message IDs"]
+    for col, name in enumerate(headers_i, start=1):
+        c = ws_img.cell(row=1, column=col, value=name)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    r_idx = 2
+    for h, items in sorted(image_map.items(), key=lambda x: -len(x[1])):
+        doms = sorted(set(it["from_domain"] for it in items if it["from_domain"]))
+        subs = " | ".join(it["subject"][:60] for it in items[:4])
+        ids = ", ".join(it["id"] for it in items[:6])
+        ws_img.cell(row=r_idx, column=1, value=h).font = CELL_FONT
+        ws_img.cell(row=r_idx, column=2, value=image_phash.get(h, "")).font = CELL_FONT
+        ws_img.cell(row=r_idx, column=3, value=len(items)).font = CELL_FONT
+        ws_img.cell(row=r_idx, column=4, value=len(doms)).font = CELL_FONT
+        c_names = ws_img.cell(row=r_idx, column=5, value="; ".join(sorted(image_names[h])[:4]))
+        c_names.font = CELL_FONT
+        c_names.alignment = WRAP
+        c_subs = ws_img.cell(row=r_idx, column=6, value=subs)
+        c_subs.font = CELL_FONT
+        c_subs.alignment = WRAP
+        ws_img.cell(row=r_idx, column=7, value=ids).font = CELL_FONT
+        r_idx += 1
+    ws_img.freeze_panes = "A2"
+    if r_idx > 2:
+        ws_img.auto_filter.ref = f"A1:G{r_idx-1}"
+    for col_letter, w in zip("ABCDEFG", (22, 20, 12, 20, 30, 60, 40)):
+        ws_img.column_dimensions[col_letter].width = w
+
     # ---- Operator Fingerprints (contacts/phones/wallets reused across domains) ----
     # A value that shows up in messages sent from 2+ different (often
     # random-string, disposable) sender domains is a much stronger signal
@@ -536,12 +603,17 @@ def main():
         if len(doms) < 2:
             continue
         fingerprints.append((kind, w, "wallet", doms, 0))
+    for h, items in image_map.items():
+        doms = sorted(set(it["from_domain"] for it in items if it["from_domain"]))
+        if len(doms) < 2:
+            continue
+        fingerprints.append(("image", h, "image", doms, 1))
 
     fingerprints.sort(key=lambda x: (x[4], -len(x[3])))
 
     r_idx = 2
     for kind, value, conf_label, doms, _ in fingerprints:
-        is_strong = conf_label in ("functional", "wallet")
+        is_strong = conf_label in ("functional", "wallet", "image")
         conf_fill = FUNCTIONAL_FILL if is_strong else FILLER_FILL
         conf_font = FUNCTIONAL_FONT if is_strong else FILLER_FONT
         ws6.cell(row=r_idx, column=1, value=kind).font = CELL_FONT
@@ -562,6 +634,53 @@ def main():
     ws6.column_dimensions["C"].width = 14
     ws6.column_dimensions["D"].width = 20
     ws6.column_dimensions["E"].width = 70
+
+    # ---- Trends (per-month view -- the point of the whole exercise) ----
+    # Volume by category, the month's top impersonated brands, and how many
+    # sender domains appeared for the first time that month (burner-domain
+    # churn). Rows whose Date header couldn't be parsed land in "(unknown)".
+    ws_trends = wb.create_sheet("Trends")
+    by_month = defaultdict(list)
+    for r in rows:
+        by_month[month_of(r) or "(unknown)"].append(r)
+    domain_first_month = {}
+    for m in sorted(by_month):
+        for r in by_month[m]:
+            d = r.get("from_domain")
+            if d and d not in domain_first_month:
+                domain_first_month[d] = m
+    headers_tr = ["Month", "Total", "Likely Scam", "Review", "Bulk Marketing",
+                  "New Sender Domains", "Top Brands"]
+    for col, name in enumerate(headers_tr, start=1):
+        c = ws_trends.cell(row=1, column=col, value=name)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    r_idx = 2
+    for m in sorted(by_month):
+        items = by_month[m]
+        cats = Counter(it["category"] for it in items)
+        new_domains = sum(1 for d, fm in domain_first_month.items() if fm == m)
+        brand_counts = Counter()
+        for it in items:
+            for b in (it.get("impersonated_brands") or "").split(";"):
+                if b.strip():
+                    brand_counts[b.strip()] += 1
+        top_brands = ", ".join(f"{b} ({n})" for b, n in brand_counts.most_common(3))
+        ws_trends.cell(row=r_idx, column=1, value=m).font = CELL_FONT
+        ws_trends.cell(row=r_idx, column=2, value=len(items)).font = CELL_FONT
+        c_scam = ws_trends.cell(row=r_idx, column=3, value=cats.get("likely_scam", 0))
+        c_scam.font = CELL_FONT
+        c_scam.fill = CAT_FILLS["likely_scam"]
+        ws_trends.cell(row=r_idx, column=4, value=cats.get("review", 0)).font = CELL_FONT
+        ws_trends.cell(row=r_idx, column=5, value=cats.get("bulk_marketing", 0)).font = CELL_FONT
+        ws_trends.cell(row=r_idx, column=6, value=new_domains).font = CELL_FONT
+        c_brands = ws_trends.cell(row=r_idx, column=7, value=top_brands)
+        c_brands.font = CELL_FONT
+        c_brands.alignment = WRAP
+        r_idx += 1
+    ws_trends.freeze_panes = "A2"
+    for col_letter, w in zip("ABCDEFG", (12, 10, 12, 10, 16, 20, 50)):
+        ws_trends.column_dimensions[col_letter].width = w
 
     # ---- Summary: cross-campaign signals (filled in now that the other
     # tabs' data is available) ----

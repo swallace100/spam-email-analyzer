@@ -45,26 +45,47 @@ zipped by day, in `data/scanned/` either way.
 1. **Extract**: Sender info, SPF/DKIM/DMARC, originating IPs, URLs,
    phone numbers, crypto wallet addresses, and contact emails from the
    body. This includes ones hidden with cheap obfuscation tricks like
-   `name (at) domain (dot) com`, zero-width characters, or Cyrillic
-   look-alike letters (`ioc_lib.deobfuscate`).
-2. **Triage**: Rule-based and no LLM/API calls. It sorts each email into
-   `likely_scam`, `review`, or `bulk_marketing`. It then separately tags which
-   brand or institution it appears to be impersonating
-   (`ioc_lib.IMPERSONATED_BRANDS`).
-3. **Classify confidence**: Phone numbers and contact emails are split
+   `name (at) domain (dot) com`, zero-width characters, HTML entities,
+   fullwidth/stylized Unicode, or Cyrillic look-alike letters
+   (`ioc_lib.deobfuscate`). HTML bodies are parsed properly (not
+   tag-stripped), which recovers `<a href>` URLs, remote image domains,
+   and anchor-text-vs-href mismatches (`<a href="evil.top">paypal.com</a>`),
+   while excluding `display:none` word-salad blocks.
+2. **Triage**: Rule-based and no LLM/API calls. Each email gets a weighted
+   `scam_score` from stacked signals -- urgent keywords, a brand name in the
+   From display name sent from a non-official domain, Reply-To diverted to
+   freemail, DKIM/SPF/DMARC failures, recently registered sender domains
+   (from your WHOIS enrichment), deceptive links, punycode/shortener URLs,
+   wallet addresses -- which maps to `likely_scam`, `review`, or
+   `bulk_marketing`. The contributing signals are kept per-row in
+   `scam_signals` so every score can be audited and tuned. It also tags
+   which brand or institution the mail appears to be impersonating
+   (`ioc_lib.IMPERSONATED_BRANDS`); keyword phrases match flexibly
+   ("verify your account" also catches "verify your Amazon account").
+3. **Analyze images**: Every inline/attached image is hashed (sha256), so a
+   reused image is an operator fingerprint just like a reused phone number.
+   With `Pillow`+`imagehash` installed, a perceptual hash also links
+   recompressed/resized variants of the same artwork. With `pytesseract`
+   (plus the Tesseract binary) installed, image-only spam is OCR'd and the
+   recovered text flows through the normal keyword/extraction pipeline.
+   All of this is local -- no LLM/API calls -- and each tier degrades
+   gracefully if its dependency isn't installed.
+4. **Classify confidence**: Phone numbers and contact emails are split
    into `functional` (real call-to-action language) vs `filler`
    (word-salad/camouflage noise). See `ioc_lib.classify_contacts` and
    `classify_phones`.
-4. **Fingerprint the body template**: A SimHash of the body with the
+5. **Fingerprint the body template**: A SimHash of the body with the
    parts that vary per-blast (URLs, contacts, wallets) stripped out, so
    campaigns sharing a template get linked even across different senders
    with different contact info (`ioc_lib.body_template_fingerprint`).
-5. **Report**: A formatted `.xlsx` with tabs for the full email list,
+6. **Report**: A formatted `.xlsx` with tabs for the full email list,
    domain clustering, WHOIS enrichment, a brand-impersonation breakdown,
-   template clusters, and "Operator Fingerprints". Any contact email,
-   phone number, or crypto wallet that repeats across 2+ sender domains,
-   the strongest signal this dataset can surface that messages trace back
-   to the same operator.
+   template clusters, image reuse, "Operator Fingerprints" (any contact
+   email, phone number, crypto wallet, or image that repeats across 2+
+   sender domains -- the strongest signal this dataset can surface that
+   messages trace back to the same operator), and a per-month "Trends"
+   tab: volume by category, top impersonated brands, and burner-domain
+   churn over time.
 
 ## Files
 
@@ -80,6 +101,15 @@ zipped by day, in `data/scanned/` either way.
 ```bash
 pip install -r requirements.txt
 ```
+
+For OCR of image-only spam (optional), also install the
+[Tesseract binary](https://github.com/tesseract-ocr/tesseract) and
+`pip install pytesseract`. Without it, images are still hashed and
+perceptually fingerprinted -- their text just isn't read.
+
+Note on schemas: when a new version adds columns, `process_mail.py`
+migrates `data/master_iocs.csv` in place on its next run (old rows keep
+blank values for the new columns).
 
 ### Analyze emails
 
@@ -160,13 +190,15 @@ for you to fill in yourself.
 
 - Keyword-based triage, brand detection, and deobfuscation are all
   pattern-based, not exhaustive
-  - Triage/brand tuning lives in `ioc_lib.py` (`URGENT_KEYWORDS`, `KNOWN_LEGIT_DOMAINS`,
-    `IMPERSONATED_BRANDS`) and needs occasional updates as new patterns show
-    up. Deobfuscation (`ioc_lib.deobfuscate`) only undoes a handful of known
-    tricks (`[at]`/`[dot]`, zero-width characters, a small set of
-    Cyrillic/Greek look-alikes). It's not a general Unicode-confusables
-    solution. None of this can see text embedded in images (e.g. a brand
-    logo rendered as a picture rather than plain text).
+  - Triage/brand tuning lives in `ioc_lib.py` (`URGENT_KEYWORDS`,
+    `KNOWN_LEGIT_DOMAINS`, `IMPERSONATED_BRANDS`, `BRAND_LEGIT_DOMAINS`,
+    and the signal weights in `ioc_lib.triage`) and needs occasional
+    updates as new patterns show up. Deobfuscation (`ioc_lib.deobfuscate`)
+    undoes NFKC-foldable Unicode tricks, `[at]`/`[dot]`, zero-width
+    characters, and a small set of Cyrillic/Greek look-alikes -- wider than
+    before, but still not a full Unicode-confusables solution. Text inside
+    images is only visible when OCR (Tesseract) is installed, and OCR
+    quality varies with the image.
 - Phone/email extraction is regex-based
   - It is not a full NLP pipeline. It's tuned to reduce false positives
     (e.g. tracking/order numbers being mistaken for phone numbers)

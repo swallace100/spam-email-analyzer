@@ -1,2 +1,13 @@
 openpyxl>=3.1
 python-whois>=0.9
+
+# Image analysis (optional -- everything degrades gracefully without these).
+# Pillow + imagehash enable perceptual hashing of image attachments, so
+# recompressed/resized copies of the same scam artwork still cluster.
+Pillow>=10
+imagehash>=4.3
+
+# OCR of image-only spam (optional). pytesseract also needs the Tesseract
+# binary installed and on PATH: https://github.com/tesseract-ocr/tesseract
+# Uncomment once Tesseract is installed:
+# pytesseract>=0.3
