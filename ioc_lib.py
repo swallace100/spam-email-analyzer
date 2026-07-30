@@ -496,8 +496,17 @@ def extract_ips(received_headers):
     """Public IPs from the Received chain, in header order (first = the hop
     closest to you, last = closest to the true origin). Candidates are
     validated with ipaddress -- the bare regex also matches version strings
-    like '15.21.270.5' -- and private/reserved relay hops are dropped."""
-    ip_re = re.compile(r'\[?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\]?')
+    like '15.21.270.5' -- and private/reserved relay hops are dropped.
+
+    IPs are only extracted when bracket/paren-delimited ("from x ([1.2.3.4])",
+    "(1.2.3.4)"), which is how every real connecting-client IP appears in a
+    Received header. This deliberately excludes bare dotted-quad tokens
+    elsewhere in the header text -- most importantly Microsoft Exchange's
+    "with Microsoft SMTP Server (...) id 15.21.245.11" build/version stamp,
+    which is not an IP at all but happens to fall in a real, globally-routable
+    /8 (historically HP's) and so would otherwise pass validation and get
+    mistaken for a shared-infrastructure signal across unrelated messages."""
+    ip_re = re.compile(r'[\[\(](\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})[\]\)]')
     ips = []
     for h in received_headers:
         for m in ip_re.finditer(h):

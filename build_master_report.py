@@ -53,6 +53,21 @@ def load_ip_enrichment():
         return {r["ip"]: r for r in csv.DictReader(f)}
 
 
+def _is_likely_exchange_artifact(ip, enr):
+    """Flags a known false-positive class: Microsoft Exchange's Received
+    header format includes a bare build/version stamp ("with Microsoft SMTP
+    Server (...) id 15.21.245.11") that is NOT a network hop, but numerically
+    falls inside a real, globally-routable /8 (historically HP's) -- so it
+    resolves via IP enrichment to isp='HP Inc.' with no ASN, and recurs
+    identically across unrelated messages since it's a software version, not
+    an address. ioc_lib.extract_ips (fixed to require bracket/paren-delimited
+    IPs) no longer produces these for newly-ingested mail, but rows whose raw
+    .eml predates the fix and was never archived can't be re-derived, so
+    their originating_ips may still contain one. Never treat a flagged row as
+    evidence in an abuse report without independently verifying it."""
+    return ip.startswith("15.") and enr.get("isp") == "HP Inc." and not enr.get("asn")
+
+
 def origin_ip_of(row):
     """Best guess at the true origin IP of a message: the LAST public IP in
     originating_ips. extract_ips preserves Received-header order (top =
@@ -443,6 +458,58 @@ def main():
         c = ws_asn.cell(row=r_idx + 1, column=1,
                         value=f"{len(unenriched_ips)} origin IP(s) not yet enriched -- "
                               "run lookup_ips.py and rebuild.")
+        c.font = Font(name=FONT, italic=True, size=10, color="666666")
+
+    # ---- IP Addresses (every distinct origin IP, individually) ----
+    # Origin ASNs groups by provider; this is the same story at IP
+    # granularity -- the level of detail an abuse report actually needs
+    # (a hosting provider's abuse desk wants the specific IP, not just
+    # "your ASN"). Same best-guess-origin caveat as Origin ASNs applies.
+    ws_ip = wb.create_sheet("IP Addresses")
+    ip_map = defaultdict(list)
+    for r in rows:
+        ip = origin_ip_of(r)
+        if ip:
+            ip_map[ip].append(r)
+    headers_ip = ["IP Address", "ASN", "AS Name", "ISP", "Country", "Times Seen",
+                  "Distinct Sender Domains", "Sample Subjects", "Sample Message IDs"]
+    for col, name in enumerate(headers_ip, start=1):
+        c = ws_ip.cell(row=1, column=col, value=name)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    ARTIFACT_FILL = PatternFill("solid", fgColor="F2F2F2")
+    ARTIFACT_FONT = Font(name=FONT, size=10, italic=True, color="808080")
+    r_idx = 2
+    n_artifacts = 0
+    for ip, items in sorted(ip_map.items(), key=lambda x: -len(x[1])):
+        enr = ip_enrichment.get(ip, {})
+        is_artifact = _is_likely_exchange_artifact(ip, enr)
+        if is_artifact:
+            n_artifacts += 1
+        doms = sorted(set(it["from_domain"] for it in items if it["from_domain"]))
+        subs = " | ".join(it["subject"][:60] for it in items[:4])
+        ids = ", ".join(it["id"] for it in items[:6])
+        asn_display = "(likely Exchange version stamp, not a real IP)" if is_artifact else enr.get("asn", "")
+        values_ip = [ip, asn_display, enr.get("as_name", ""), enr.get("isp", ""),
+                     enr.get("country", ""), len(items), len(doms), subs, ids]
+        for col, val in enumerate(values_ip, start=1):
+            c = ws_ip.cell(row=r_idx, column=col, value=val)
+            c.font = ARTIFACT_FONT if is_artifact else CELL_FONT
+            if is_artifact:
+                c.fill = ARTIFACT_FILL
+            if col == 8:
+                c.alignment = WRAP
+        r_idx += 1
+    ws_ip.freeze_panes = "A2"
+    if r_idx > 2:
+        ws_ip.auto_filter.ref = f"A1:I{r_idx-1}"
+    for col_letter, w_ in zip("ABCDEFGHI", (16, 10, 24, 24, 20, 11, 20, 60, 40)):
+        ws_ip.column_dimensions[col_letter].width = w_
+    if n_artifacts:
+        c = ws_ip.cell(row=r_idx + 1, column=1,
+                        value=f"{n_artifacts} greyed-out row(s) are likely Microsoft Exchange "
+                              "build/version stamps misread as IPs (see ioc_lib.extract_ips docstring) "
+                              "-- do not cite these in an abuse report without independent verification.")
         c.font = Font(name=FONT, italic=True, size=10, color="666666")
 
     # ---- Template Clusters (messages sharing a body template) ----
@@ -848,12 +915,19 @@ def main():
         if len(doms) < 2:
             continue
         fingerprints.append(("image", h, "image", doms, 1))
+    for ip, items in ip_map.items():
+        if _is_likely_exchange_artifact(ip, ip_enrichment.get(ip, {})):
+            continue
+        doms = sorted(set(it["from_domain"] for it in items if it["from_domain"]))
+        if len(doms) < 2:
+            continue
+        fingerprints.append(("ip", ip, "ip", doms, 0))
 
     fingerprints.sort(key=lambda x: (x[4], -len(x[3])))
 
     r_idx = 2
     for kind, value, conf_label, doms, _ in fingerprints:
-        is_strong = conf_label in ("functional", "wallet", "image")
+        is_strong = conf_label in ("functional", "wallet", "image", "ip")
         conf_fill = FUNCTIONAL_FILL if is_strong else FILLER_FILL
         conf_font = FUNCTIONAL_FONT if is_strong else FILLER_FONT
         ws6.cell(row=r_idx, column=1, value=kind).font = CELL_FONT
