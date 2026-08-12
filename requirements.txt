@@ -9,5 +9,4 @@ imagehash>=4.3
 
 # OCR of image-only spam (optional). pytesseract also needs the Tesseract
 # binary installed and on PATH: https://github.com/tesseract-ocr/tesseract
-# Uncomment once Tesseract is installed:
-# pytesseract>=0.3
+pytesseract>=0.3
