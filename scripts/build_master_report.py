@@ -13,6 +13,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
+import ioc_lib
+
 # scripts/ lives one level below the repo root that data/, output/, and
 # dashboard/ hang off of.
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -94,6 +96,20 @@ def origin_ip_of(row):
         except ValueError:
             continue
     return ""
+
+
+def sender_group_key(row):
+    """Grouping key for 'who sent this' aggregation. A domain like
+    gmail.com or icloud.com is shared by millions of unrelated accounts,
+    so lumping all of it into one bucket hides which specific address to
+    report to Google/Apple/etc. -- group those by the full From address
+    instead. Everything else groups by domain as usual."""
+    domain = row.get("from_domain") or ""
+    if domain in ioc_lib.FREEMAIL_DOMAINS:
+        addr = (row.get("from_addr") or "").strip().lower()
+        if addr:
+            return addr
+    return domain
 
 
 def month_of(row):
@@ -219,10 +235,10 @@ def main():
         ws.cell(row=row, column=3, value=cat_counts.get(cat, 0)).font = CELL_FONT
 
     row += 2
-    domain_counter = Counter(r["from_domain"] for r in rows if r["from_domain"])
-    ws.cell(row=row, column=2, value="Repeated sender domains (2+ messages)").font = Font(name=FONT, bold=True, size=11)
+    domain_counter = Counter(sender_group_key(r) for r in rows if r["from_domain"])
+    ws.cell(row=row, column=2, value="Repeated sender domains/addresses (2+ messages)").font = Font(name=FONT, bold=True, size=11)
     row += 1
-    ws.cell(row=row, column=2, value="Domain").font = HEADER_FONT
+    ws.cell(row=row, column=2, value="Domain / Address").font = HEADER_FONT
     ws.cell(row=row, column=2).fill = HEADER_FILL
     ws.cell(row=row, column=3, value="Count").font = HEADER_FONT
     ws.cell(row=row, column=3).fill = HEADER_FILL

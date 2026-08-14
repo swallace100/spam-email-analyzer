@@ -151,15 +151,24 @@ def main():
         })
 
     # ---- Sender domains (all -- the UI filters; xlsx only shows 2+) ----
+    # Freemail providers (gmail.com, icloud.com, ...) are grouped by full
+    # From address instead of domain -- a mega-domain like gmail.com hides
+    # which specific account to report to Google, so bmr.sender_group_key
+    # breaks those out into individual rows while everything else still
+    # groups by domain.
     cluster_map = defaultdict(list)
     for r in rows:
         if r["from_domain"]:
-            cluster_map[r["from_domain"]].append(r)
+            cluster_map[bmr.sender_group_key(r)].append(r)
     domains = []
-    for d, items in sorted(cluster_map.items(), key=lambda x: -len(x[1])):
-        enr = enrichment.get(d, {})
+    for key, items in sorted(cluster_map.items(), key=lambda x: -len(x[1])):
+        is_addr = "@" in key
+        provider_domain = items[0]["from_domain"]
+        enr = enrichment.get(provider_domain, {})
         domains.append({
-            "domain": defang_domain(d),
+            "domain": defang_email(key) if is_addr else defang_domain(key),
+            "is_freemail_address": is_addr,
+            "provider": defang_domain(provider_domain) if is_addr else "",
             "count": len(items),
             "categories": sorted(set(it["category"] for it in items)),
             "registered": enr.get("registered_date", ""),

@@ -374,9 +374,13 @@ function viewEmails(d) {
 function viewSenders(d) {
   const domains = el("div", { class: "panel" },
     el("h2", {}, "Sender domains"),
-    el("div", { class: "sub" }, "Highlighted rows have WHOIS enrichment. Recently registered = burner."),
+    el("div", { class: "sub" },
+      "Highlighted rows have WHOIS enrichment. Recently registered = burner. " +
+      "Gmail/iCloud/Outlook/etc. senders are broken out by full address (not lumped under the " +
+      "provider's domain) since abuse reports for those go to the provider per-account, not per-domain."),
     dataTable(d.domains, [
-      { key: "domain", label: "Domain", render: (r) => iocCell(r.domain) },
+      { key: "domain", label: "Domain / Address", render: (r) => iocCell(r.domain) },
+      { key: "provider", label: "Provider", render: (r) => r.provider ? badge(r.provider, "neutral") : "" },
       { key: "count", label: "Messages", num: true },
       { key: "categories", label: "Categories", render: (r) => el("span", {}, r.categories.map(catBadge)) },
       { key: "registered", label: "Registered" },
@@ -384,8 +388,13 @@ function viewSenders(d) {
       { key: "registrant_country", label: "Country" },
       { key: "nameservers", label: "Nameservers", render: (r) => pills(r.nameservers, 3) },
       colSubjects,
-    ], { filters: [{ key: "enriched", label: "WHOIS", options: ["true", "false"],
-          match: (r, v) => String(r.enriched) === v, format: (o) => o === "true" ? "enriched" : "not enriched" }] }));
+    ], { filters: [
+      { key: "is_freemail_address", label: "Type", options: ["true", "false"],
+          match: (r, v) => String(r.is_freemail_address) === v,
+          format: (o) => o === "true" ? "freemail address" : "domain" },
+      { key: "enriched", label: "WHOIS", options: ["true", "false"],
+          match: (r, v) => String(r.enriched) === v, format: (o) => o === "true" ? "enriched" : "not enriched" },
+    ] }));
 
   const reg = el("div", { class: "panel" },
     el("h2", {}, "Registration clusters"),
