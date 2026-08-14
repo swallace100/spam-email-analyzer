@@ -35,7 +35,9 @@ try:
 except ImportError:
     HAS_TESSERACT = False
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+# scripts/ lives one level below the repo root that data/, output/, and
+# dashboard/ hang off of.
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 URL_RE = re.compile(r'https?://[^\s"\'<>\)\]]+', re.IGNORECASE)
 

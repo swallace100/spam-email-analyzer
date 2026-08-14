@@ -24,7 +24,9 @@ from collections import Counter
 
 import whois
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+# scripts/ lives one level below the repo root that data/, output/, and
+# dashboard/ hang off of.
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MASTER_CSV = os.path.join(BASE, "data", "master_iocs.csv")
 ENRICHMENT_CSV = os.path.join(BASE, "data", "domain_enrichment.csv")
 # nameservers/registrant fields exist so the report can correlate burner
@@ -118,7 +120,7 @@ def lookup_one(domain):
     }
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--all", action="store_true",
@@ -131,7 +133,7 @@ def main():
                         help="Re-query already-enriched domains whose nameservers "
                              "column is blank (rows recorded before that column "
                              "existed). Their rows are updated in place.")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if not os.path.exists(MASTER_CSV):
         print(f"No {MASTER_CSV} yet -- nothing to look up.")

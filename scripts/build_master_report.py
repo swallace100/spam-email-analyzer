@@ -13,14 +13,26 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+# scripts/ lives one level below the repo root that data/, output/, and
+# dashboard/ hang off of.
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MASTER_CSV = os.path.join(BASE, "data", "master_iocs.csv")
 MASTER_URLS_CSV = os.path.join(BASE, "data", "master_urls.csv")
 ENRICHMENT_CSV = os.path.join(BASE, "data", "domain_enrichment.csv")
 WALLET_ENRICHMENT_CSV = os.path.join(BASE, "data", "wallet_enrichment.csv")
 WALLET_TRANSACTIONS_CSV = os.path.join(BASE, "data", "wallet_transactions.csv")
 IP_ENRICHMENT_CSV = os.path.join(BASE, "data", "ip_enrichment.csv")
+ACTIONS_CSV = os.path.join(BASE, "data", "actions.csv")
 OUT_XLSX = os.path.join(BASE, "output", "master_report.xlsx")
+
+
+def load_actions():
+    """Enforcement actions taken (IC3/abuse reports), logged via
+    scripts/log_action.py or by hand-editing data/actions.csv."""
+    if not os.path.exists(ACTIONS_CSV):
+        return []
+    with open(ACTIONS_CSV, encoding="utf-8") as f:
+        return list(csv.DictReader(f))
 
 
 def load_wallet_enrichment():
@@ -948,6 +960,40 @@ def main():
     ws6.column_dimensions["C"].width = 14
     ws6.column_dimensions["D"].width = 20
     ws6.column_dimensions["E"].width = 70
+
+    # ---- Actions Taken (the enforcement record) ----
+    # What you actually DID with all this: IC3 complaints, registrar and
+    # hosting abuse reports, Chainabuse filings. This is the sheet to open
+    # when a follow-up asks "when did you report it and under what number".
+    actions = load_actions()
+    ws_act = wb.create_sheet("Actions Taken")
+    headers_act = ["Date", "Action", "Target Type", "Target", "Reference", "Status", "Notes"]
+    for col, name in enumerate(headers_act, start=1):
+        c = ws_act.cell(row=1, column=col, value=name)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    r_idx = 2
+    for a in sorted(actions, key=lambda x: x.get("date", ""), reverse=True):
+        values_act = [a.get("date", ""), a.get("action", ""), a.get("target_type", ""),
+                      a.get("target", ""), a.get("reference", ""), a.get("status", ""),
+                      a.get("notes", "")]
+        for col, val in enumerate(values_act, start=1):
+            c = ws_act.cell(row=r_idx, column=col, value=val)
+            c.font = CELL_FONT
+            if col in (4, 7):
+                c.alignment = WRAP
+        r_idx += 1
+    ws_act.freeze_panes = "A2"
+    if r_idx > 2:
+        ws_act.auto_filter.ref = f"A1:G{r_idx-1}"
+    else:
+        c = ws_act.cell(row=2, column=1,
+                        value="No actions logged yet -- record one with "
+                              "scripts/log_action.py (or edit data/actions.csv; "
+                              "see data/actions_example.csv for the format).")
+        c.font = Font(name=FONT, italic=True, size=10, color="666666")
+    for col_letter, w_ in zip("ABCDEFG", (12, 18, 12, 42, 26, 14, 60)):
+        ws_act.column_dimensions[col_letter].width = w_
 
     # ---- Trends (per-month view -- the point of the whole exercise) ----
     # Volume by category, the month's top impersonated brands, and how many

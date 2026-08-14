@@ -42,7 +42,9 @@ import urllib.request
 from collections import defaultdict
 from datetime import date, datetime, timezone
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+# scripts/ lives one level below the repo root that data/, output/, and
+# dashboard/ hang off of.
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MASTER_CSV = os.path.join(BASE, "data", "master_iocs.csv")
 ENRICHMENT_CSV = os.path.join(BASE, "data", "wallet_enrichment.csv")
 ENRICHMENT_FIELDNAMES = [
@@ -282,7 +284,7 @@ def write_transactions(rows):
             writer.writerow({k: r.get(k, "") for k in TRANSACTIONS_FIELDNAMES})
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--delay", type=float, default=DEFAULT_DELAY_SECONDS,
@@ -291,7 +293,7 @@ def main():
                         help="Look up at most N addresses this run.")
     parser.add_argument("--recheck", action="store_true",
                         help="Re-query addresses already enriched (replaces their rows).")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if not os.path.exists(MASTER_CSV):
         print(f"No {MASTER_CSV} yet -- nothing to look up.")

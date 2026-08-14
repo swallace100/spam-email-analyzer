@@ -1,0 +1,211 @@
+/* Scam Email Tracker dashboard — dark-only, SOC-console look.
+   Palette/token roles follow the dataviz reference palette (dark column). */
+
+:root {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --surface-2: #222220;
+  --ink: #ffffff;
+  --ink-2: #c3c2b7;
+  --muted: #898781;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --border: rgba(255, 255, 255, 0.10);
+  --series-1: #3987e5;   /* blue */
+  --series-2: #d95926;   /* orange */
+  --series-3: #199e70;   /* aqua */
+  --critical: #d03b3b;
+  --warning: #fab219;
+  --good: #0ca30c;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink-2);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 18px 24px 0;
+}
+header h1 { margin: 0; font-size: 19px; color: var(--ink); letter-spacing: 0.2px; }
+header .meta { color: var(--muted); font-size: 12px; }
+
+nav {
+  display: flex;
+  gap: 2px;
+  flex-wrap: wrap;
+  padding: 12px 24px 0;
+  border-bottom: 1px solid var(--grid);
+}
+nav button {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 13px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+nav button:hover { color: var(--ink); background: var(--surface); }
+nav button.active {
+  color: var(--ink);
+  border-bottom-color: var(--series-1);
+  font-weight: 600;
+}
+
+main { padding: 20px 24px 60px; max-width: 1500px; margin: 0 auto; }
+section.view { display: none; }
+section.view.active { display: block; }
+
+.cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 18px;
+  min-width: 150px;
+  flex: 1;
+}
+.card .v { font-size: 26px; color: var(--ink); font-weight: 600; }
+.card .v.crit { color: var(--critical); }
+.card .v.warn { color: var(--warning); }
+.card .k { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px 18px;
+  margin-bottom: 18px;
+}
+.panel h2 { margin: 0 0 4px; font-size: 14px; color: var(--ink); }
+.panel .sub { font-size: 12px; color: var(--muted); margin-bottom: 12px; }
+.panel-row { display: flex; gap: 18px; flex-wrap: wrap; }
+.panel-row .panel { flex: 1; min-width: 380px; }
+
+/* charts */
+.chart-wrap { position: relative; overflow-x: auto; }
+svg text { font: 11px system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--muted); }
+svg .lbl { fill: var(--ink-2); }
+svg .val { fill: var(--ink-2); font-variant-numeric: tabular-nums; }
+.legend { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 10px; font-size: 12px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+
+#tooltip {
+  position: fixed;
+  display: none;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 10px;
+  font-size: 12px;
+  color: var(--ink-2);
+  pointer-events: none;
+  z-index: 10;
+  max-width: 340px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+}
+#tooltip b { color: var(--ink); }
+
+/* tables */
+.toolbar { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; align-items: center; }
+.toolbar input[type="search"] {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--ink);
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 13px;
+  width: 280px;
+}
+.toolbar select {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--ink);
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 13px;
+}
+.toolbar .count { color: var(--muted); font-size: 12px; margin-left: auto; }
+
+.tbl-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+thead th {
+  position: sticky;
+  top: 0;
+  background: var(--surface-2);
+  color: var(--ink);
+  text-align: left;
+  padding: 8px 10px;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+  border-bottom: 1px solid var(--axis);
+}
+thead th .dir { color: var(--series-1); }
+tbody td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--grid);
+  vertical-align: top;
+  max-width: 420px;
+  overflow-wrap: anywhere;
+}
+tbody tr:hover { background: var(--surface-2); }
+tbody tr.expandable { cursor: pointer; }
+tr.detail td { background: var(--page); font-size: 12px; }
+.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+.ioc { font-family: var(--mono); font-size: 12px; }
+.nowrap { white-space: nowrap; }
+.dim { color: var(--muted); }
+
+.badge {
+  display: inline-block;
+  border-radius: 4px;
+  padding: 1px 7px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.badge.likely_scam { background: rgba(208, 59, 59, 0.18); color: #e66767; }
+.badge.review { background: rgba(250, 178, 25, 0.15); color: var(--warning); }
+.badge.bulk_marketing { background: rgba(57, 135, 229, 0.15); color: #86b6ef; }
+.badge.functional { background: rgba(12, 163, 12, 0.16); color: #4bc34b; }
+.badge.filler { background: rgba(137, 135, 129, 0.18); color: var(--muted); }
+.badge.wallet, .badge.active { background: rgba(208, 59, 59, 0.18); color: #e66767; }
+.badge.image, .badge.ip { background: rgba(57, 135, 229, 0.15); color: #86b6ef; }
+.badge.reported { background: rgba(12, 163, 12, 0.16); color: #4bc34b; cursor: help; }
+.card .v.good { color: #4bc34b; }
+.badge.pass { color: #4bc34b; }
+.badge.fail { color: #e66767; }
+.badge.neutral { color: var(--muted); }
+
+.pill-list { display: flex; flex-wrap: wrap; gap: 4px; }
+.pill-list span {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 6px;
+  font-size: 11px;
+  font-family: var(--mono);
+}
+
+a { color: #86b6ef; }
+.note { color: var(--muted); font-size: 12px; margin-top: 10px; }
+.detail-grid { display: grid; grid-template-columns: 170px 1fr; gap: 3px 14px; padding: 6px 4px; }
+.detail-grid dt { color: var(--muted); }
+.detail-grid dd { margin: 0; overflow-wrap: anywhere; }

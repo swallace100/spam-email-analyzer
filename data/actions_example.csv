@@ -1,0 +1,5 @@
+date,action,target_type,target,reference,status,notes
+2026-08-01,ic3_report,wallet,1ExampleBtcAddressXXXXXXXXXXXXXXXX,IC3 Complaint #I2608011234567,submitted,Included full tx list from wallet_transactions.csv
+2026-08-02,registrar_abuse,domain,evil-example.top,GoDaddy ticket 12345678,acknowledged,Sent headers from msg a1b2c3d4 to abuse@godaddy.com
+2026-08-03,hosting_abuse,ip,203.0.113.9,OVH abuse ref ABC-123,submitted,Origin of 12 likely_scam messages (see IP Addresses tab)
+2026-08-04,chainabuse_report,wallet,1ExampleBtcAddressXXXXXXXXXXXXXXXX,chainabuse.com report,submitted,Cross-filed after the IC3 report

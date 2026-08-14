@@ -30,7 +30,9 @@ import time
 import urllib.request
 from datetime import date
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+# scripts/ lives one level below the repo root that data/, output/, and
+# dashboard/ hang off of.
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MASTER_CSV = os.path.join(BASE, "data", "master_iocs.csv")
 ENRICHMENT_CSV = os.path.join(BASE, "data", "ip_enrichment.csv")
 ENRICHMENT_FIELDNAMES = ["ip", "asn", "as_name", "isp", "org", "country",
@@ -79,14 +81,14 @@ def lookup_batch(ips):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--limit", type=int, default=None,
                         help="Look up at most N IPs this run.")
     parser.add_argument("--recheck", action="store_true",
                         help="Re-query IPs already enriched (replaces their rows).")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if not os.path.exists(MASTER_CSV):
         print(f"No {MASTER_CSV} yet -- nothing to look up.")

@@ -2,10 +2,15 @@
 data/*
 output/
 
+# Dashboard data payload -- extracted (defanged) indicators, same privacy
+# rules as data/. The dashboard app itself (html/js/css/config) IS committed.
+dashboard/data/
+
 # ...except manual WHOIS/registrar research -- that's about the scam
 # infrastructure, not your email content, so it's fine (and useful) to
 # keep in git history.
 !data/domain_enrichment_example.csv
+!data/actions_example.csv
 
 # ...and the self-addresses format template (no real addresses in it).
 !data/self_addresses_example.txt

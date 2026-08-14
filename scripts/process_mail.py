@@ -16,6 +16,7 @@ Run this after dropping in new exports, then run build_master_report.py
 to refresh the .xlsx report.
 """
 
+import argparse
 import mailbox
 import email
 import csv
@@ -26,7 +27,9 @@ from datetime import date
 
 import ioc_lib
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+# scripts/ lives one level below the repo root that data/, output/, and
+# dashboard/ hang off of.
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INPUT_DIR = os.path.join(BASE, "data", "input")
 SCANNED_DIR = os.path.join(BASE, "data", "scanned")
 MASTER_CSV = os.path.join(BASE, "data", "master_iocs.csv")
@@ -185,7 +188,38 @@ def append_rows(rows, url_rows):
         writer.writerows(url_rows)
 
 
-def main():
+def run_lookups():
+    """Run the three enrichment lookups with their default (new-IOCs-only)
+    behavior, so a normal ingest leaves the enrichment CSVs current without
+    a separate manual step. Each is independent and network-bound, so one
+    failing (WHOIS rate limit, API hiccup) shouldn't stop the others -- or
+    the ingest itself, which already succeeded by this point. All three
+    no-op quickly when there's nothing new."""
+    import lookup_ips
+    import lookup_domains
+    import lookup_wallets
+    for name, mod in (("lookup_ips", lookup_ips),
+                      ("lookup_domains", lookup_domains),
+                      ("lookup_wallets", lookup_wallets)):
+        print(f"\n--- {name} ---")
+        try:
+            mod.main([])
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            print(f"{name} failed ({e}); continuing -- "
+                  f"run 'python {name}.py' manually to retry.")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--skip-lookups", action="store_true",
+                        help="Don't run the WHOIS/IP/wallet enrichment lookups "
+                             "after ingesting (they run automatically by default; "
+                             "each only queries IOCs it hasn't seen before).")
+    args = parser.parse_args(argv)
+
     os.makedirs(INPUT_DIR, exist_ok=True)
     os.makedirs(SCANNED_DIR, exist_ok=True)
     migrate_schema()
@@ -233,7 +267,9 @@ def main():
             print(f"Skipped {total_dupes} duplicate message(s) already in {MASTER_CSV}")
 
     zip_dated_folders()
-    print("Run build_master_report.py to refresh the .xlsx report.")
+    if not args.skip_lookups:
+        run_lookups()
+    print("\nRun build_master_report.py to refresh the .xlsx report.")
 
 
 if __name__ == "__main__":

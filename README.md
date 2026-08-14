@@ -6,7 +6,19 @@ emails, triaging them, and compiling them into a running spreadsheet report.
 ## How it works
 
 This is a batch tool, not a live service. Drop email files into
-`data/input/`, run `process_mail.py`, then `build_master_report.py`.
+`data/input/`, run `scripts/process_mail.py`, then
+`scripts/build_master_report.py`. (Or run everything at once with
+`.\publish.ps1` -- see "Web dashboard" below.)
+
+Repo layout:
+
+```
+scripts/     all Python (entry points + shared ioc_lib.py)
+data/        the CSVs (source of truth), input/, scanned/ archives -- gitignored
+output/      master_report.xlsx -- gitignored
+dashboard/   static web dashboard; dashboard/data/ is gitignored
+publish.ps1  the one-command pipeline
+```
 
 `process_mail.py`:
 
@@ -20,6 +32,13 @@ This is a batch tool, not a live service. Drop email files into
   `data/scanned/` (e.g. `data/scanned/2026-07-25.zip`). Running the tool
   more than once in a day adds a `_2`, `_3`, etc. suffix instead of
   overwriting that day's zip.
+- Runs the three enrichment lookups (`lookup_ips.py`, `lookup_domains.py`,
+  `lookup_wallets.py`) automatically after ingesting, each with its default
+  new-IOCs-only behavior, so the enrichment CSVs stay current without a
+  separate manual step. A lookup failing (WHOIS rate limit, API hiccup)
+  doesn't affect the ingest or the other lookups. Pass `--skip-lookups`
+  to opt out (e.g. offline, or when you want the finer-grained flags the
+  standalone scripts offer, like `--all` or `--recheck`).
 
 `build_master_report.py` rebuilds `output/master_report.xlsx` from those
 CSVs. A full rebuild every time, not an append, so the CSVs are always
@@ -89,14 +108,21 @@ zipped by day, in `data/scanned/` either way.
 
 ## Files
 
-| File                     | Purpose                                                                                                                                                        |
-| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ioc_lib.py`             | Shared extraction + triage logic. Everything else imports this.                                                                                                |
-| `process_mail.py`        | Main entry point. Ingests every `.eml`/`.mbox` file in `data/input/` and moves it into a dated, zipped archive under `data/scanned/` once it's been processed. |
-| `build_master_report.py` | Rebuilds the formatted `.xlsx` report from the running CSV. Safe to re-run any time -- a full rebuild, not an append.                                          |
-| `lookup_domains.py`      | Optional. Runs WHOIS lookups for sender domains (registration date, registrar, nameservers, registrant) into `data/domain_enrichment.csv`, with a delay between requests. |
-| `lookup_wallets.py`      | Optional. Looks up on-chain activity for extracted crypto wallets (free public APIs, no key) and writes `data/wallet_enrichment.csv` for the Wallets tab.      |
-| `lookup_ips.py`          | Optional. Maps originating IPs to ASN/hosting provider/country via ip-api.com's free batch endpoint, into `data/ip_enrichment.csv` for the Origin ASNs tab.   |
+| File                             | Purpose                                                                                                                                                        |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `scripts/ioc_lib.py`             | Shared extraction + triage logic. Everything else imports this.                                                                                                |
+| `scripts/process_mail.py`        | Main entry point. Ingests every `.eml`/`.mbox` file in `data/input/` and moves it into a dated, zipped archive under `data/scanned/` once it's been processed. |
+| `scripts/build_master_report.py` | Rebuilds the formatted `.xlsx` report from the running CSV. Safe to re-run any time -- a full rebuild, not an append.                                          |
+| `scripts/lookup_domains.py`      | Optional. Runs WHOIS lookups for sender domains (registration date, registrar, nameservers, registrant) into `data/domain_enrichment.csv`, with a delay between requests. |
+| `scripts/lookup_wallets.py`      | Optional. Looks up on-chain activity for extracted crypto wallets (free public APIs, no key) and writes `data/wallet_enrichment.csv` for the Wallets tab.      |
+| `scripts/lookup_ips.py`          | Optional. Maps originating IPs to ASN/hosting provider/country via ip-api.com's free batch endpoint, into `data/ip_enrichment.csv` for the Origin ASNs tab.   |
+| `scripts/build_dashboard_data.py` | Rebuilds `dashboard/data/data.json` (defanged indicators + aggregates) from the CSVs for the web dashboard. Full rebuild, like the xlsx.                      |
+| `scripts/log_action.py`          | Logs an enforcement action you took (IC3 report, registrar abuse ticket...) into `data/actions.csv` -- see "Action log" below.                                  |
+| `dashboard/`                     | Static web dashboard (no build step, no dependencies). Deployable to Azure Static Web Apps' free tier behind authentication.                                   |
+| `publish.ps1`                    | One command: ingest → lookups → xlsx → dashboard JSON → `swa deploy`.                                                                                          |
+
+All three `lookup_*.py` scripts still work standalone, but also run
+automatically at the end of every `process_mail.py` ingest (see above).
 
 ## Setup
 
@@ -119,7 +145,7 @@ Put email files into `data/input/`. They can be individual `.eml` files, a `.mbo
 export, or both. Then run:
 
 ```bash
-python3 process_mail.py
+python scripts/process_mail.py
 ```
 
 This extracts IOCs from every file in `data/input/`, appends new rows to
@@ -137,7 +163,7 @@ default `source` of `input`.
 Once the CSVs are updated, build the report:
 
 ```bash
-python3 build_master_report.py
+python scripts/build_master_report.py
 ```
 
 Outputs `output/master_report.xlsx`.
@@ -176,7 +202,7 @@ domain,registered_date,registrar,notes
 You can fill it in by hand, or run `lookup_domains.py` to do it via WHOIS:
 
 ```bash
-python3 lookup_domains.py
+python scripts/lookup_domains.py
 ```
 
 By default this only looks up sender domains that showed up in 2+
@@ -197,7 +223,7 @@ free batch endpoint (no key; HTTP-only free tier, rate-limited -- the
 script stays under the limit automatically):
 
 ```bash
-python3 lookup_ips.py
+python scripts/lookup_ips.py
 ```
 
 The report's "Origin ASNs" tab then aggregates messages by the ASN of
@@ -232,8 +258,8 @@ what makes an IC3 (ic3.gov) or [Chainabuse](https://chainabuse.com) report
 actionable.
 
 ```bash
-python3 lookup_wallets.py            # new wallets only
-python3 lookup_wallets.py --recheck  # refresh previously checked ones
+python scripts/lookup_wallets.py            # new wallets only
+python scripts/lookup_wallets.py --recheck  # refresh previously checked ones
 ```
 
 These are read-only lookups of public ledger data. No interaction with the
@@ -251,6 +277,86 @@ Transactions" tab lists the same data, with incoming transactions
 (funds received by the scam wallet) highlighted -- outgoing rows show
 where the money moved on next, which is worth including in a report too
 since it's the next hop in the trail.
+
+## Action log (what you did about it)
+
+The rest of this toolkit records what the scammers did; `data/actions.csv`
+records what *you* did back -- IC3 complaints, registrar abuse tickets
+(GoDaddy etc.), hosting-provider abuse reports, Chainabuse filings. That
+record matters: follow-ups ask "when did you report it and under what
+case number", and a documented trail is what separates a report from a
+shoebox of screenshots.
+
+Log an action with the helper (or just edit the CSV in Excel -- see
+`data/actions_example.csv` for the format):
+
+```powershell
+python scripts/log_action.py ic3_report wallet 1AbC... --ref "IC3 #I2608..." --notes "included full tx list"
+python scripts/log_action.py registrar_abuse domain evil.top --ref "GoDaddy ticket 123" --status acknowledged
+python scripts/log_action.py --list
+```
+
+Columns: `date, action, target_type, target, reference, status, notes`.
+Targets are logged un-defanged (paste straight from the CSVs); the
+dashboard defangs them on export. After a rebuild, the xlsx gets an
+"Actions Taken" sheet, the dashboard gets an "Actions Taken" tab, and any
+indicator you've acted on shows a green "reported" badge in its own table
+(hover it for the case reference). `data/actions.csv` is gitignored like
+the rest of your data.
+
+## Web dashboard (Azure Static Web Apps, free tier)
+
+`dashboard/` is a single-page, dependency-free web app that renders the
+same story as the xlsx -- monthly trends, sender domains, origin
+ASNs/IPs, indicators, wallets, template clusters, operator fingerprints --
+as searchable, sortable tables and charts.
+
+**Privacy model:** all processing stays local. The only thing that ever
+gets deployed is `dashboard/` -- the app plus `dashboard/data/data.json`,
+which `build_dashboard_data.py` builds from the master CSVs. That file
+contains extracted indicators and aggregate stats only (no raw emails, no
+message bodies), and every attacker-controlled value in it is defanged
+threat-intel style (`hxxps[://]evil[.]top`, `name[@]evil[.]top`,
+`203[.]0[.]113[.]9`) so nothing renders as a live link. The deployed site
+is also locked behind authentication (see below) since indicator data is
+your research/evidence.
+
+Preview locally (no Azure needed):
+
+```powershell
+python scripts/build_dashboard_data.py
+python -m http.server -d dashboard 8080    # http://localhost:8080
+```
+
+One-time Azure setup:
+
+1. Create a **free-plan** Static Web App in the Azure portal (deployment
+   source: "Other" -- no GitHub Action, so the indicator data never
+   touches a git remote).
+2. `npm install -g @azure/static-web-apps-cli`
+3. Portal → your app → **Manage deployment token**, then store it:
+   `[Environment]::SetEnvironmentVariable("SWA_CLI_DEPLOYMENT_TOKEN", "<token>", "User")`
+4. Portal → **Role management** → Invite your Microsoft account with the
+   custom role `analyst`. `dashboard/staticwebapp.config.json` only
+   admits that role, so nobody else -- even someone who can log in with
+   some Microsoft account -- can view the site. (GitHub/Twitter login
+   routes are disabled outright.)
+
+Then every update is just:
+
+```powershell
+.\publish.ps1                # ingest + lookups + xlsx + json + deploy
+.\publish.ps1 -SkipIngest    # no new mail, just rebuild + deploy
+.\publish.ps1 -SkipDeploy    # everything local, deploy nothing
+```
+
+Why this shape: the free SWA tier hosts static files and built-in auth
+only -- no server, no database to pay for or patch. The CSVs stay the
+single source of truth locally, and the dashboard is a snapshot of them,
+exactly like the xlsx. And because raw spam never leaves your machine,
+there's nothing in the deployment that a cloud provider's content
+scanning could object to -- it's the same class of data as any hosted
+threat-intel feed.
 
 ## Known limitations
 
