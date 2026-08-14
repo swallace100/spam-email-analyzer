@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/staticwebapp.config.json",
   "routes": [
     {
-      "route": "/.auth/login/github",
+      "route": "/.auth/login/aad",
       "statusCode": 404
     },
     {
@@ -20,7 +20,7 @@
   ],
   "responseOverrides": {
     "401": {
-      "redirect": "/.auth/login/aad",
+      "redirect": "/.auth/login/github",
       "statusCode": 302
     }
   },

@@ -336,11 +336,13 @@ One-time Azure setup:
 2. `npm install -g @azure/static-web-apps-cli`
 3. Portal → your app → **Manage deployment token**, then store it:
    `[Environment]::SetEnvironmentVariable("SWA_CLI_DEPLOYMENT_TOKEN", "<token>", "User")`
-4. Portal → **Role management** → Invite your Microsoft account with the
-   custom role `analyst`. `dashboard/staticwebapp.config.json` only
-   admits that role, so nobody else -- even someone who can log in with
-   some Microsoft account -- can view the site. (GitHub/Twitter login
-   routes are disabled outright.)
+4. Portal → your Static Web App → **Settings → Role management** →
+   Invite: provider **GitHub**, your GitHub username, role `analyst`,
+   then open the generated invite link while signed into GitHub.
+   `dashboard/staticwebapp.config.json` only admits that role, so nobody
+   else -- even someone who can log in with some other GitHub account --
+   can view the site. (Microsoft/Twitter login routes are disabled
+   outright; unauthenticated visits redirect to GitHub login.)
 
 Then every update is just:
 

@@ -16,8 +16,10 @@
 #   3. Grab the deployment token (portal: your SWA -> Manage deployment token)
 #      and set it once for your user:
 #        [Environment]::SetEnvironmentVariable("SWA_CLI_DEPLOYMENT_TOKEN", "<token>", "User")
-#   4. Lock the site to yourself: portal -> Role management -> Invite, your
-#      email, role "analyst" (staticwebapp.config.json only admits that role).
+#   4. Lock the site to yourself: portal -> Settings -> Role management ->
+#      Invite, provider GitHub, your GitHub username, role "analyst"
+#      (staticwebapp.config.json only admits that role), then open the
+#      invite link while signed into GitHub.
 
 param(
     [switch]$SkipIngest,
