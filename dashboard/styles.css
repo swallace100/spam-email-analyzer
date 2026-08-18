@@ -141,6 +141,19 @@ svg .val { fill: var(--ink-2); font-variant-numeric: tabular-nums; }
   font-size: 13px;
 }
 .toolbar .count { color: var(--muted); font-size: 12px; margin-left: auto; }
+.toolbar .pager { display: flex; gap: 8px; align-items: center; }
+.toolbar .pager .page-label { color: var(--muted); font-size: 12px; }
+.toolbar .pager button {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--ink);
+  padding: 5px 10px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.toolbar .pager button:disabled { opacity: 0.4; cursor: default; }
 
 .tbl-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
 table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
