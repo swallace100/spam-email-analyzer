@@ -348,6 +348,35 @@ def main(argv=None):
                     tx_records.append({"address": addr, "chain": chain, **rec})
                 tx_by_addr[addr] = tx_records
                 print(f"      -> saved {len(tx_records)} transaction(s) to {os.path.basename(TRANSACTIONS_CSV)}")
+        except urllib.error.HTTPError as e:
+            if e.code == 400:
+                # The API rejected the address itself (malformed -- usually
+                # an OCR false positive from image text, not a real wallet).
+                # That's stable, not transient, so record it as a permanent
+                # "Bad Request" row rather than leaving it out of results:
+                # leaving it out would keep it out of `already` and this
+                # same bad address would get re-queried every single run.
+                prior = results.get(addr, {})
+                explorer_url = (f"https://blockstream.info/address/{addr}" if chain == "BTC"
+                                else f"https://eth.blockscout.com/address/{addr}")
+                results[addr] = {
+                    "address": addr,
+                    "chain": chain,
+                    "tx_count": "",
+                    "total_received": "",
+                    "balance": "",
+                    "first_seen": "",
+                    "last_seen": "",
+                    "checked_date": date.today().isoformat(),
+                    "explorer_url": explorer_url,
+                    "chainabuse_url": f"https://www.chainabuse.com/address/{addr}",
+                    "notes": prior.get("notes", "") or "Bad Request (400) -- API rejected this address, likely malformed/OCR error",
+                }
+                ok += 1
+                print(f"  [{i + 1}/{len(todo)}] {chain} {addr}: Bad Request (400) -- "
+                      f"marking as invalid so it won't be re-queried")
+            else:
+                print(f"  [{i + 1}/{len(todo)}] {chain} {addr}: lookup failed ({e})")
         except Exception as e:
             print(f"  [{i + 1}/{len(todo)}] {chain} {addr}: lookup failed ({e})")
         if i < len(todo) - 1:

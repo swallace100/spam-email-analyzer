@@ -23,6 +23,7 @@ import time
 from collections import Counter
 
 import whois
+import whois.exceptions
 
 # scripts/ lives one level below the repo root that data/, output/, and
 # dashboard/ hang off of.
@@ -169,6 +170,22 @@ def main(argv=None):
                 updated[domain] = info
             else:
                 new_rows.append({"domain": domain, "notes": "", **info})
+        except whois.exceptions.PywhoisError as e:
+            # The whois library itself failed to get an answer (no server
+            # known for this TLD, empty response, unparseable output) --
+            # that's a property of the domain/TLD, not a network blip, and
+            # it fails the same way every time. Record it as a permanent
+            # "Bad Request" row so it won't be re-queried every run; retry
+            # it later with --refill-missing (blank nameservers qualify).
+            print(f"  [{i + 1}/{len(todo)}] {domain}: Bad Request -- WHOIS lookup failed "
+                  f"({e}); marking as invalid so it won't be re-queried")
+            note = f"Bad Request -- WHOIS lookup failed: {e}"
+            if domain in already:
+                updated[domain] = {"notes": note}
+            else:
+                new_rows.append({"domain": domain, "registered_date": "", "registrar": "",
+                                 "nameservers": "", "registrant_org": "",
+                                 "registrant_country": "", "notes": note})
         except Exception as e:
             print(f"  [{i + 1}/{len(todo)}] {domain}: lookup failed ({e})")
         if i < len(todo) - 1:
