@@ -8,6 +8,7 @@ import { dataTable, badge, catBadge, iocCell, pills, colSubjects, colDomains, co
 function viewOverview(d) {
   const c = d.category_counts;
   const activeWallets = d.wallets.filter((w) => w.active).length;
+  const untriaged = (d.triage_queue || []).length;
   const cards = el("div", { class: "cards" },
     el("div", { class: "card" }, el("div", { class: "v" }, d.message_total.toLocaleString()),
       el("div", { class: "k" }, "messages analyzed")),
@@ -15,6 +16,9 @@ function viewOverview(d) {
       el("div", { class: "k" }, "likely scam")),
     el("div", { class: "card" }, el("div", { class: "v warn" }, String(c.review || 0)),
       el("div", { class: "k" }, "needs review")),
+    el("div", { class: "card" },
+      el("div", { class: "v" + (untriaged ? " warn" : " good") }, String(untriaged)),
+      el("div", { class: "k" }, "untriaged")),
     el("div", { class: "card" }, el("div", { class: "v" }, String(d.fingerprints.length)),
       el("div", { class: "k" }, "operator fingerprints")),
     el("div", { class: "card" },
@@ -65,6 +69,37 @@ function viewOverview(d) {
 
   return el("div", {}, cards, trendPanel,
     el("div", { class: "panel-row" }, brandPanel, asnPanel), fpPanel);
+}
+
+function viewTriage(d) {
+  const q = d.triage_queue || [];
+  return el("div", { class: "panel" },
+    el("h2", {}, "Triage queue"),
+    el("div", { class: "sub" },
+      `${q.length} likely_scam/review message(s) with no entry in data/triage.csv yet. ` +
+      "Mark one off the queue with scripts/mark_triage.py (reviewed/dismissed/escalated), " +
+      "then rebuild to see it drop off here: " +
+      'python scripts/mark_triage.py <Message Id> reviewed --notes "..."'),
+    q.length
+      ? dataTable(q, [
+          { key: "scam_score", label: "Score", num: true },
+          { key: "category", label: "Category", render: (r) => catBadge(r.category) },
+          { key: "date", label: "Date",
+            render: (r) => /^\d{4}-\d{2}-\d{2}/.test(r.date) ? r.date.slice(0, 10) : r.date,
+            sortVal: (r) => Date.parse(r.date) || 0 },
+          { key: "subject", label: "Subject" },
+          { key: "from_addr", label: "From", render: (r) => el("span", { class: "ioc" }, r.from_addr) },
+          { key: "from_domain", label: "From domain", render: (r) => el("span", { class: "ioc" }, r.from_domain) },
+          { key: "scam_signals", label: "Scam signals", render: (r) => pills(r.scam_signals, 6) },
+          { key: "id", label: "Message Id", render: (r) => el("span", { class: "ioc" }, r.id) },
+        ], {
+          pageSize: 50,
+          filters: [
+            { key: "category", label: "Category",
+              options: ["likely_scam", "review"], format: (o) => CAT_LABELS[o] },
+          ],
+        })
+      : el("div", { class: "note" }, "Nothing untriaged — every likely_scam/review message has been marked."));
 }
 
 function emailDetail(r) {
@@ -319,6 +354,7 @@ function viewActions(d) {
 
 export const VIEWS = [
   ["overview", "Overview", viewOverview],
+  ["triage", "Triage Queue", viewTriage],
   ["emails", "Emails", viewEmails],
   ["senders", "Sender Domains", viewSenders],
   ["infra", "Infrastructure", viewInfra],

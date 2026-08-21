@@ -97,14 +97,15 @@ zipped by day, in `data/scanned/` either way.
    parts that vary per-blast (URLs, contacts, wallets) stripped out, so
    campaigns sharing a template get linked even across different senders
    with different contact info (`ioc_lib.body_template_fingerprint`).
-6. **Report**: A formatted `.xlsx` with tabs for the full email list,
-   domain clustering, WHOIS enrichment, a brand-impersonation breakdown,
-   template clusters, image reuse, "Operator Fingerprints" (any contact
-   email, phone number, crypto wallet, or image that repeats across 2+
-   sender domains -- the strongest signal this dataset can surface that
-   messages trace back to the same operator), and a per-month "Trends"
-   tab: volume by category, top impersonated brands, and burner-domain
-   churn over time.
+6. **Report**: A formatted `.xlsx` with tabs for the full email list, a
+   "Triage Queue" of not-yet-reviewed `likely_scam`/`review` messages
+   (see "Triage queue" below), domain clustering, WHOIS enrichment, a
+   brand-impersonation breakdown, template clusters, image reuse,
+   "Operator Fingerprints" (any contact email, phone number, crypto
+   wallet, or image that repeats across 2+ sender domains -- the
+   strongest signal this dataset can surface that messages trace back to
+   the same operator), and a per-month "Trends" tab: volume by category,
+   top impersonated brands, and burner-domain churn over time.
 
 ## Files
 
@@ -118,6 +119,7 @@ zipped by day, in `data/scanned/` either way.
 | `scripts/lookup_ips.py`          | Optional. Maps originating IPs to ASN/hosting provider/country via ip-api.com's free batch endpoint, into `data/ip_enrichment.csv` for the Origin ASNs tab.   |
 | `scripts/build_dashboard_data.py` | Rebuilds `dashboard/data/data.json` (defanged indicators + aggregates) from the CSVs for the web dashboard. Full rebuild, like the xlsx.                      |
 | `scripts/log_action.py`          | Logs an enforcement action you took (IC3 report, registrar abuse ticket...) into `data/actions.csv` -- see "Action log" below.                                  |
+| `scripts/mark_triage.py`         | Marks a message as looked at (reviewed/dismissed/escalated) into `data/triage.csv` -- see "Triage queue" below.                                                 |
 | `dashboard/`                     | Static web dashboard (no build step, no dependencies). Deployable to Azure Static Web Apps' free tier behind authentication.                                   |
 | `publish.ps1`                    | One command: ingest → lookups → xlsx → dashboard JSON → `swa deploy`.                                                                                          |
 
@@ -277,6 +279,46 @@ Transactions" tab lists the same data, with incoming transactions
 (funds received by the scam wallet) highlighted -- outgoing rows show
 where the money moved on next, which is worth including in a report too
 since it's the next hop in the trail.
+
+## Triage queue (what you haven't looked at yet)
+
+New mail all lands in the same pile as everything else, which makes it
+easy to miss something -- `process_mail.py` just appends to
+`master_iocs.csv`, it doesn't flag what's new. The **Triage Queue**
+(xlsx sheet and dashboard tab) fixes that: it's every `likely_scam`/
+`review` message that has no entry in `data/triage.csv`, sorted by
+`scam_score` (highest first). `bulk_marketing` never enters the queue --
+it's not worth a re-review by design.
+
+Like `data/actions.csv`, `data/triage.csv` is append-only and never
+rebuilt, so it survives every `build_master_report.py`/
+`build_dashboard_data.py` regeneration even though the queue itself is
+recomputed fresh each time. `category` (`likely_scam`/`review`/
+`bulk_marketing`) is unrelated and never changes -- it's what gets a
+message *into* the queue. `status` in `triage.csv` is what gets it *out*.
+
+Mark a message off the queue once you've looked at it:
+
+```bash
+python scripts/mark_triage.py <Message Id> reviewed --notes "just a coupon blast, nothing to do"
+python scripts/mark_triage.py <Message Id> escalated --notes "active BTC wallet, filing IC3"
+python scripts/mark_triage.py --list
+```
+
+The message id is the `id` column in `master_iocs.csv` / the "Message
+Id" column in the Emails and Triage Queue sheets. `reviewed`,
+`dismissed`, and `escalated` are just suggested labels for your own
+bookkeeping -- any status removes it from the queue, since presence in
+`triage.csv` is all that's checked. Not every triaged message needs an
+enforcement action: use `dismissed` for the ones that don't, and
+separately log an action with `scripts/log_action.py` for the ones that
+do (see below) -- the two files track different things. Rebuild the
+report/dashboard afterward to see it drop off:
+
+```bash
+python scripts/build_master_report.py
+python scripts/build_dashboard_data.py
+```
 
 ## Action log (what you did about it)
 

@@ -124,6 +124,34 @@ def main():
 
     cat_counts = Counter(r["category"] for r in rows)
 
+    # ---- Triage queue (likely_scam/review messages not yet triaged) ----
+    # data/triage.csv is append-only (written by scripts/mark_triage.py),
+    # never rebuilt, so a message marked triaged stays off this list across
+    # data.json regenerations even though this list itself is rebuilt fresh
+    # from master_iocs.csv every run, same as everything else here.
+    triage_status = bmr.load_triage()
+    untriaged = [r for r in rows
+                 if r.get("category") in bmr.TRIAGE_CATEGORIES and r["id"] not in triage_status]
+
+    def _score(r):
+        try:
+            return int(r.get("scam_score") or 0)
+        except ValueError:
+            return 0
+
+    untriaged.sort(key=lambda r: (_score(r), r.get("date_iso") or ""), reverse=True)
+    triage_queue = [{
+        "id": r["id"],
+        "category": r.get("category", ""),
+        "scam_score": _score(r),
+        "date": r.get("date_iso", "") or r.get("date", ""),
+        "subject": r.get("subject", ""),
+        "from_name": r.get("from_name", ""),
+        "from_addr": defang_email(r.get("from_addr", "")),
+        "from_domain": defang_domain(r.get("from_domain", "")),
+        "scam_signals": _split(r.get("scam_signals")),
+    } for r in untriaged]
+
     # ---- Trends (per month) ----
     by_month = defaultdict(list)
     for r in rows:
@@ -469,6 +497,7 @@ def main():
         "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "message_total": len(rows),
         "category_counts": dict(cat_counts),
+        "triage_queue": triage_queue,
         "unenriched_ip_count": len(unenriched_ips),
         "trends": trends,
         "domains": domains,
