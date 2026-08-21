@@ -6,14 +6,13 @@ output/
 # rules as data/. The dashboard app itself (html/js/css/config) IS committed.
 dashboard/data/
 
-# ...except manual WHOIS/registrar research -- that's about the scam
-# infrastructure, not your email content, so it's fine (and useful) to
-# keep in git history.
+# These files potentially contain sensitive informataion
 data/domain_enrichment.csv
 data/actions.csv
 
-# ...and the self-addresses format template (no real addresses in it).
+# These are example files
 !data/self_addresses_example.txt
+!data/triage_example.csv
 
 # Python
 __pycache__/

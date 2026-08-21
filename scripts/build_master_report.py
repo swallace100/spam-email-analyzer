@@ -25,7 +25,10 @@ WALLET_ENRICHMENT_CSV = os.path.join(BASE, "data", "wallet_enrichment.csv")
 WALLET_TRANSACTIONS_CSV = os.path.join(BASE, "data", "wallet_transactions.csv")
 IP_ENRICHMENT_CSV = os.path.join(BASE, "data", "ip_enrichment.csv")
 ACTIONS_CSV = os.path.join(BASE, "data", "actions.csv")
+TRIAGE_CSV = os.path.join(BASE, "data", "triage.csv")
 OUT_XLSX = os.path.join(BASE, "output", "master_report.xlsx")
+
+TRIAGE_CATEGORIES = ("likely_scam", "review")
 
 
 def load_actions():
@@ -35,6 +38,17 @@ def load_actions():
         return []
     with open(ACTIONS_CSV, encoding="utf-8") as f:
         return list(csv.DictReader(f))
+
+
+def load_triage():
+    """Ids marked triaged via scripts/mark_triage.py. This CSV is only ever
+    appended to, never rebuilt, so marking something here sticks across
+    report regenerations -- unlike every other sheet, which is a full
+    rebuild from master_iocs.csv each run."""
+    if not os.path.exists(TRIAGE_CSV):
+        return {}
+    with open(TRIAGE_CSV, encoding="utf-8") as f:
+        return {r["id"]: r for r in csv.DictReader(f)}
 
 
 def load_wallet_enrichment():
@@ -252,6 +266,60 @@ def main():
     ws.column_dimensions["A"].width = 3
     ws.column_dimensions["B"].width = 50
     ws.column_dimensions["C"].width = 14
+
+    # ---- Triage Queue (likely_scam/review messages not yet triaged) ----
+    # data/triage.csv is append-only (written by scripts/mark_triage.py),
+    # never rebuilt, so a message marked triaged stays off this list across
+    # report regenerations even though the sheet itself is rebuilt fresh
+    # from master_iocs.csv every run like everything else here.
+    triage = load_triage()
+    untriaged = [r for r in rows
+                 if r.get("category") in TRIAGE_CATEGORIES and r["id"] not in triage]
+
+    def _score(r):
+        try:
+            return int(r.get("scam_score") or 0)
+        except ValueError:
+            return 0
+
+    untriaged.sort(key=lambda r: (_score(r), r.get("date_iso") or ""), reverse=True)
+
+    ws_triage = wb.create_sheet("Triage Queue")
+    headers_tq = ["Scam Score", "Category", "Date", "Subject", "From Name", "From Addr",
+                  "From Domain", "Scam Signals", "Message Id"]
+    for col, name in enumerate(headers_tq, start=1):
+        c = ws_triage.cell(row=1, column=col, value=name)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+    r_idx = 2
+    for r in untriaged:
+        cat_fill = CAT_FILLS.get(r.get("category", ""))
+        values_tq = [_score(r), r.get("category", ""), r.get("date_iso", "") or r.get("date", ""),
+                     r.get("subject", ""), r.get("from_name", ""), r.get("from_addr", ""),
+                     r.get("from_domain", ""), r.get("scam_signals", ""), r["id"]]
+        for col, val in enumerate(values_tq, start=1):
+            c = ws_triage.cell(row=r_idx, column=col, value=val)
+            c.font = CELL_FONT
+            if col == 8:
+                c.alignment = WRAP
+            if col == 2 and cat_fill:
+                c.fill = cat_fill
+        r_idx += 1
+    ws_triage.freeze_panes = "A2"
+    if r_idx > 2:
+        ws_triage.auto_filter.ref = f"A1:I{r_idx-1}"
+    else:
+        c = ws_triage.cell(row=2, column=1,
+                           value="Nothing untriaged -- every likely_scam/review message has "
+                                 "been marked with scripts/mark_triage.py.")
+        c.font = Font(name=FONT, italic=True, size=10, color="666666")
+    for col_letter, w_ in zip("ABCDEFGHI", (12, 14, 20, 40, 16, 28, 22, 50, 30)):
+        ws_triage.column_dimensions[col_letter].width = w_
+    if untriaged:
+        c = ws_triage.cell(row=r_idx + 1, column=1,
+                           value=f"Mark a message triaged with: python scripts/mark_triage.py "
+                                 f"<Message Id> reviewed --notes \"...\"")
+        c.font = Font(name=FONT, italic=True, size=10, color="666666")
 
     # ---- Emails (all) ----
     ws2 = wb.create_sheet("Emails")
@@ -1068,6 +1136,9 @@ def main():
     row += 1
     ws.cell(row=row, column=2, value="Operator fingerprints (contact/phone/wallet reused across domains)").font = CELL_FONT
     ws.cell(row=row, column=3, value=len(fingerprints)).font = CELL_FONT
+    row += 1
+    ws.cell(row=row, column=2, value="Untriaged (likely_scam/review not yet marked -- see Triage Queue)").font = CELL_FONT
+    ws.cell(row=row, column=3, value=len(untriaged)).font = CELL_FONT
 
     if brand_map:
         row += 2
